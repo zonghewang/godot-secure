@@ -1,61 +1,14 @@
 name: 🏁 Windows Builds
+
 on:
-  workflow_call:
   workflow_dispatch:
-
-# Global Settings
-env:
-  SCONS_FLAGS: >-
-    dev_mode=yes
-    module_text_server_fb_enabled=yes
-    debug_symbols=no
-    "angle_libs=${{ github.workspace }}/"
-    "accesskit_sdk_path=${{ github.workspace }}/accesskit-c-0.18.0/"
-  SCONS_CACHE_MSVC_CONFIG: true
-  PYTHONIOENCODING: utf8
-
 jobs:
-  build-windows:
-    # Windows 10 with latest image
+  build:
     runs-on: windows-latest
-    name: ${{ matrix.name }}
-    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - name: Editor (target=editor)
-            cache-name: windows-editor
-            target: editor
-            scons-flags: >-
-              windows_subsystem=console
-              vsproj=yes
-              vsproj_gen_only=no
-            bin: ./bin/godot.windows.editor.x86_64.exe
-            compiler: msvc
-
-          - name: Editor w/ clang-cl (target=editor, use_llvm=yes)
-            cache-name: windows-editor-clang
-            target: editor
-            scons-flags: >-
-              windows_subsystem=console
-              use_llvm=yes
-            bin: ./bin/godot.windows.editor.x86_64.llvm.exe
-            compiler: clang
-
-          - name: Template (target=template_release)
-            cache-name: windows-template
-            target: template_release
-            bin: ./bin/godot.windows.template_release.x86_64.console.exe
-            compiler: msvc
-
-          - name: Template w/ GCC (target=template_release, use_mingw=yes)
-            cache-name: windows-template-gcc
-            # MinGW takes MUCH longer to compile; save time by only targeting Template.
-            target: template_release
-            scons-flags: use_mingw=yes
-            bin: ./bin/godot.windows.template_release.x86_64.console.exe
-            compiler: gcc
+        target: [editor, template_release]
 
     steps:
       - name: Checkout
@@ -63,75 +16,113 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Restore Godot build cache
-        uses: ./.github/actions/godot-cache-restore
-        with:
-          cache-name: ${{ matrix.cache-name }}
-        continue-on-error: true
+      - name: Setup SCons
+        run: pip install scons
 
-      - name: Setup Python and SCons
-        uses: ./.github/actions/godot-deps
-
-      - name: Download Direct3D 12 SDK components
-        shell: sh
-        id: d3d12-sdk
+      - name: Load Encryption Key
+        id: load_key
+        shell: pwsh
         run: |
-          if python ./misc/scripts/install_d3d12_sdk_windows.py; then
-            echo "D3D12_ENABLED=yes" >> "$GITHUB_OUTPUT"
-          else
-            echo "::warning::Windows: Direct3D 12 SDK installation failed, building without Direct3D 12 support."
-            echo "D3D12_ENABLED=no" >> "$GITHUB_OUTPUT"
-          fi
-        continue-on-error: true
 
-      - name: Download pre-built ANGLE static libraries
-        uses: dsaltares/fetch-gh-release-asset@1.1.2
-        with:
-          repo: godotengine/godot-angle-static
-          version: tags/chromium/6601.2
-          file: godot-angle-static-x86_64-${{ matrix.compiler == 'gcc' && 'gcc' || 'msvc' }}-release.zip
-          target: angle/angle.zip
+          $key = "${{ secrets.GODOT_KEY }}"
+          
+          # 验证密钥长度（应为64字符）
+          if ($key.Length -ne 64) {
+            Write-Error "错误：密钥长度不正确。期望64字符，实际 $($key.Length) 字符"
+            exit 1
+          }
+          
+          # 验证密钥是否为有效十六进制
+          if ($key -notmatch '^[0-9a-fA-F]{64}$') {
+            Write-Error "错误：密钥包含无效字符，必须是64位十六进制字符串"
+            exit 1
+          }
+          
+          # 转换为小写（Godot要求）
+          $key = $key.ToLower()
+          
+          # 设置输出和环境变量
+          "SCRIPT_AES256_ENCRYPTION_KEY=$key" >> $env:GITHUB_ENV
+          
+          # 显示密钥前8位和后8位用于调试（隐藏完整密钥）
+          $masked = $key.Substring(0, 8) + "..." + $key.Substring(56, 8)
+          Write-Host "密钥验证通过：$masked (长度: $($key.Length))"
+          
+          # 设置步骤输出
+          "key_loaded=true" >> $env:GITHUB_OUTPUT
 
-      - name: Extract pre-built ANGLE static libraries
-        run: Expand-Archive -Force angle/angle.zip ${{ github.workspace }}/
-
-      - name: Download pre-built AccessKit
-        uses: dsaltares/fetch-gh-release-asset@1.1.2
-        with:
-          repo: AccessKit/accesskit-c
-          version: tags/0.18.0
-          file: accesskit-c-0.18.0.zip
-          target: accesskit-c-0.18.0/accesskit_c.zip
-
-      - name: Extract pre-built AccessKit
-        run: unzip -o accesskit-c-0.18.0/accesskit_c.zip
-
-      - name: Compilation
-        uses: ./.github/actions/godot-build
-        with:
-          scons-flags: ${{ env.SCONS_FLAGS }} ${{ matrix.scons-flags }} d3d12=${{ steps.d3d12-sdk.outputs.D3D12_ENABLED }}
-          platform: windows
-          target: ${{ matrix.target }}
-
-      - name: Save Godot build cache
-        uses: ./.github/actions/godot-cache-save
-        with:
-          cache-name: ${{ matrix.cache-name }}
-        continue-on-error: true
-
-      - name: Prepare artifact
-        if: matrix.compiler == 'msvc'
+      - name: Verify Key Transfer
+        shell: pwsh
         run: |
-          Remove-Item bin/* -Include *.exp,*.lib,*.pdb -Force
+          # 验证环境变量是否正确设置
+          if (-not $env:SCRIPT_AES256_ENCRYPTION_KEY) {
+            Write-Error "错误：SCRIPT_AES256_ENCRYPTION_KEY 环境变量未设置"
+            exit 1
+          }
+          
+          $key = $env:SCRIPT_AES256_ENCRYPTION_KEY
+          
+          # 再次验证长度
+          if ($key.Length -ne 64) {
+            Write-Error "错误：环境变量中的密钥长度不正确"
+            exit 1
+          }
+          
+          # 显示掩码后的密钥确认传递成功
+          $masked = $key.Substring(0, 8) + "..." + $key.Substring(56, 8)
+          Write-Host "环境变量验证通过：$masked (长度: $($key.Length))"
+          Write-Host "密钥传递成功，准备开始构建..."
 
-      - name: Upload artifact
-        if: matrix.compiler == 'msvc'
-        uses: ./.github/actions/upload-artifact
-        with:
-          name: ${{ matrix.cache-name }}
-
-      - name: Unit tests
+      - name: Build ${{ matrix.target }}
+        shell: pwsh
         run: |
-          ${{ matrix.bin }} --version
-          ${{ matrix.bin }} --help
-          ${{ matrix.bin }} --test --force-colors
+          Write-Host "开始构建 ${{ matrix.target }}..."
+          Write-Host "使用加密密钥构建模板（支持加密PCK解密）"
+          
+          scons platform=windows target=${{ matrix.target }} d3d12=no disable_path_overrides=no script_encryption_key="$env:SCRIPT_AES256_ENCRYPTION_KEY"
+
+      - name: Verify Build Output
+        shell: pwsh
+        run: |
+          # 检查构建产物是否存在
+          $binPath = "bin/"
+          if (-not (Test-Path $binPath)) {
+            Write-Error "错误：构建目录不存在"
+            exit 1
+          }
+          
+          # 列出构建产物
+          $files = Get-ChildItem $binPath -File
+          if ($files.Count -eq 0) {
+            Write-Error "错误：未找到构建产物"
+            exit 1
+          }
+          
+          Write-Host "构建产物列表："
+          $files | ForEach-Object { 
+            $size = [math]::Round($_.Length / 1MB, 2)
+            Write-Host "  - $($_.Name) (${size} MB)" 
+          }
+          
+          # 检查是否包含预期的可执行文件
+          $exePattern = "godot.*windows.*${{ matrix.target }}.*exe"
+          $exeFiles = $files | Where-Object { $_.Name -match $exePattern }
+          
+          if ($exeFiles.Count -eq 0) {
+            Write-Warning "警告：未找到匹配模式 $exePattern 的可执行文件"
+          } else {
+            Write-Host "找到可执行文件：$($exeFiles.Name)"
+          }
+
+      - name: Prepare artifacts (exclude obj)
+        shell: pwsh
+        run: |
+          if (Test-Path "bin\obj") { Remove-Item -Recurse -Force "bin\obj" }
+          Get-ChildItem bin/
+
+      - name: Upload ${{ matrix.target }} artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: godot-${{ matrix.target }}-windows
+          path: bin/
+          if-no-files-found: error
