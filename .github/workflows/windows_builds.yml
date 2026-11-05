@@ -2,7 +2,6 @@ name: 🏁 Windows Builds
 
 on:
   workflow_dispatch:
-
 jobs:
   build:
     runs-on: windows-latest
@@ -24,15 +23,8 @@ jobs:
         id: load_key
         shell: pwsh
         run: |
-          # 检查密钥文件是否存在
-          if (-not (Test-Path godot.gdkey)) {
-            Write-Error "错误：找不到 godot.gdkey 文件"
-            exit 1
-          }
-          
-          # 读取密钥并清理
-          $key = Get-Content godot.gdkey -Raw
-          $key = $key.Trim()
+
+          $key = "${{ secrets.GODOT_KEY }}"
           
           # 验证密钥长度（应为64字符）
           if ($key.Length -ne 64) {
