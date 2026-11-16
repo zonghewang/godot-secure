@@ -12,5 +12,17 @@ env.add_source_files(env.modules_sources, "*.cpp")
 # kernel32（MoveFileExW / CreateMutexW / GetSystemFirmwareTable / ReadProcessMemory）
 # 由 Godot 主程序默认链接，无需重复声明。
 # user32 不需要（本模块不碰窗口）。
+#
+# 注意：这里必须写进 LINKFLAGS 并带上 .lib 后缀，不能用 env.Append(LIBS=[...])。
+# Godot 的 SConstruct 会把 env["LIBSUFFIX"] 改成 ".windows.<target>.<arch>.lib"，
+# 而 SCons 的 LIBLINKSUFFIX 跟着 LIBSUFFIX 走，LIBS 里的裸名字会被拼成
+# "advapi32.windows.template_release.x86_64.lib"，链接器找不到就报 LNK1181。
+# 平台 detect.py 自己也是用 "名字 + .lib" 的形式追加到 LINKFLAGS 的。
 if env["platform"] == "windows":
-    env.Append(LIBS=["advapi32", "crypt32"])
+    if env.get("use_mingw", False):
+        # MinGW 走 GNU ld，用 -l 形式，裸名字即可
+        env.Append(LIBS=["advapi32", "crypt32"])
+    else:
+        # MSVC：LIBS 里的字符串会被 LIBLINKSUFFIX(=LIBSUFFIX) 再拼一次后缀，
+        # 必须改用 LINKFLAGS 传字面文件名
+        env.Append(LINKFLAGS=["advapi32.lib", "crypt32.lib"])
