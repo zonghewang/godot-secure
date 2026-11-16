@@ -1,0 +1,654 @@
+// =============================================================================
+//  XiewaGuard.cpp
+//  ——— 从 XiewaPai.exe 中还原的 XiewaGuard 实现类（伪代码级）———
+//
+//  目标文件 : E:\gamezip\XiewaPai\XiewaPai.exe
+//  大小     : 90,098,688 字节
+//  SHA-256  : 9AF23B57A21ACDF30EBE09DEE97B7E03C2A759F3B1D5B318BFFCA4F8926B6081
+//  基址     : 默认装载基址 0x140000000，本文所有地址均为 RVA（不含基址）
+//  引擎     : Godot 4（GDExtension 扩展类，注册进 ClassDB）
+//
+//  【还原等级声明】
+//  这是"语义级伪代码还原"，不是源码级还原。以下三类内容的可信度不同：
+//    ① 实测硬事实 —— 每个方法体逐条读过反汇编，所调 Win32 API、常量字符串、
+//       常量表字节、循环步进值、寄存器偏移，均为直读结果（附 RVA 注释）。
+//    ② 语义推定 —— 局部变量命名、参数次序、返回值含义，由调用上下文推断，
+//       逐处标注 [推定]。若与真实源码不符，影响的是可读性而非结构。
+//    ③ 未完成项 —— configure_runtime_detection 的方法体尚未定位，见文末附录 B。
+//  类无成员变量（构造/析构不含成员初始化），全部 21 个方法都是
+//  "取参 → 调 Win32 → 写回 Variant"的无状态静态封装。
+//
+//  配套文件：XiewaGuard.h（声明级）、XiewaGuard_解析报告.md（结构分析）、
+//            _impl_all.asm（20 个方法完整反汇编，1983 行）
+//
+//  ⚠⚠ 2026-11-15 重要更正 ⚠⚠
+//  本文件正文按旧的「方法→实现」映射写成，而那张表整体错位一位（旧做法取 bind
+//  之后的 lea，实测应为 bind 之前的 lea）。因此**下文每个函数的函数头地址都要下移
+//  一位**才是它真正的实现体。正确对照表见 XiewaGuard.h 顶部注释块，摘要：
+//     configure_runtime_detection → 0x38EA8E0（本文原缺）
+//     scan_runtime_detection      → 0x38ECA00（原记 0x38F04F0）
+//     audio_output_identity       → 0x38F04F0（原记 0x340D7E0）
+//     device_wrap                 → 0x340D7E0（原记 0x340DA40）
+//     device_unwrap               → 0x340DA40（原记 0x340DCB0）
+//     device_wrap_m               → 0x340DCB0（原记 0x340DED0）
+//     device_unwrap_m             → 0x340DED0（原记 0x340E0F0）
+//     device_tag                  → 0x340E0F0（原记 0x340E890）
+//     pepper                      → 0x340E890（原记同 device_tag，实为独立函数）
+//     reg_write 0x340EA60 / reg_read 0x340ECE0 / reg_erase 0x340F0F0
+//     flush_file 0x340F320 / move_file_durable 0x340F400 / single_instance_acquire 0x340F520
+//     is_release_template 0x340F590 / flavor 0x340F5A0 / vendor 0x340F5E0
+//     reg_subkey 0x340F620 / cache_dir 0x340F660 / mutex_name 0x340F6A0
+//  即：下文标注了地址 X 的那段行为，其真实主人是**表中 X 的上一行的那个方法**。
+//  详细推导与受影响结论见 xiewa_guard2d_U7与组A映射修正.md 第二节。
+// =============================================================================
+
+#include <cstdint>
+#include <cstring>
+#include <windows.h>
+#include <wincrypt.h>
+#include <shlwapi.h>
+
+namespace xw {
+
+// =============================================================================
+//  0. 常量区（全部为 .rdata 实测字节）
+// =============================================================================
+
+// 0x50A3100 —— 32 字节异或表 A（熵生成器的输出掩码）
+static const uint8_t kTblA[32] = {
+    0x8b, 0xec, 0xc2, 0xe5, 0x15, 0x38, 0x4b, 0x8d,
+    0x75, 0xb9, 0x02, 0xa9, 0xda, 0x95, 0x11, 0x4d,
+    0x69, 0xbb, 0x47, 0xce, 0xb7, 0xd6, 0x7d, 0x4f,
+    0x3f, 0x2c, 0x5b, 0xe5, 0xea, 0xb4, 0x2b, 0x5c
+};
+
+// 0x50A3120 —— 32 字节索引表 B（熵生成器的输入源）
+static const uint8_t kTblB[32] = {
+    0xf6, 0x23, 0x1e, 0xa0, 0x2c, 0x9f, 0x3a, 0x86,
+    0x46, 0x24, 0xd7, 0x7d, 0xfd, 0xa4, 0xb1, 0x33,
+    0xd3, 0x30, 0x05, 0x8d, 0x8b, 0x5d, 0xec, 0xfc,
+    0x2e, 0x23, 0x9c, 0xa6, 0x05, 0x8f, 0xa7, 0xbd
+};
+
+// 0x50A2E60 / 0x50A2E70 —— 8 个 32-bit 常量，实测等于 SHA-256 标准初值
+//   6a09e667 bb67ae85 3c6ef372 a54ff53a 510e527f 9b05688c 1f83d9ab 5be0cd19
+static const uint32_t kSha256IV[8] = {
+    0x6a09e667u, 0xbb67ae85u, 0x3c6ef372u, 0xa54ff53au,
+    0x510e527fu, 0x9b05688cu, 0x1f83d9abu, 0x5be0cd19u
+};
+
+// 0x50A2FF6 —— DPAPI 的 szDescription（UTF-16LE "ombrel\0"）
+static const wchar_t kDescOmbrel[] = L"ombrel";
+
+// 0x50A300E / 0x50A3010 —— UTF-16LE 的 '\' 与 '/'（长度 1，两条相邻）
+static const wchar_t kSepBackslash[] = L"\\";
+static const wchar_t kSepSlash[]     = L"/";
+
+// 固化字面量（每个都是 String::operator=(literal) 直接返回）
+static const char kIsReleaseTemplate[] = "release";     // 长度 7   @0x340F5A0
+static const char kFlavor[]            = "Ombrel";      // 长度 6   @0x340F5E0
+static const char kVendor[]            = "Cache";        // 长度 5   @0x340F620
+static const char kRegSubkey[]         = "cache";        // 长度 5   @0x340F660
+static const char kCacheDir[] = "Local\\Ombrel.{18657BB7-EFAC-44EA-8C0D-5D6F3E7454EB}"; // 长度 0x33=51
+static const char kRegRoot[]           = "Software\\";   // 长度 9，注意自带尾部反斜杠
+
+// =============================================================================
+//  1. 熵生成器（device_tag / pepper / audio_output_identity / device_wrap(_m) 共用）
+//     函数体见 0x340E890（device_tag）与 0x340E9E0 附近的同一段代码。
+// =============================================================================
+//
+//  反汇编原文（device_tag，0x340E890 起，寄存器态）：
+//      mov  eax, 1              ; rax = 输出下标基址（1 起步，写 [rax-1] / [rax]）
+//      mov  ecx, 0x12           ; 索引种子
+//      mov  dl,  0x3B           ; 加数种子
+//      lea  r8,  kTblA
+//      lea  r9,  kTblB
+//    loop:
+//      lea  r10d, [rcx - 0xD]   ; r10 = (rcx - 13)
+//      and  r10d, 0x1F          ;      & 31
+//      movzx r10d, byte [r10+r9]      ; B[idx]
+//      add  r10b, dl                   ; + seed
+//      add  r10b, 0xC5                 ; + 0xC5            ← 只有偶数位有这一项
+//      xor  r10b, byte [rax + r8 - 1]  ; ^ A[rax-1]
+//      mov  byte [rsp+rax+0x5F], r10b  ; out[i]
+//      mov  r10d, ecx
+//      and  r10d, 0x1E          ;      & 30
+//      movzx r10d, byte [r10+r9]      ; B[idx]
+//      add  r10b, dl                   ; + seed
+//      xor  r10b, byte [rax + r8]      ; ^ A[rax]
+//      mov  byte [rsp+rax+0x60], r10b  ; out[i+1]
+//      add  rax, 2              ; 输出 +2
+//      add  rcx, 0x1A           ; 索引种子 +26
+//      add  dl,  0x76           ; 加数种子 +118
+//      cmp  rax, 0x21           ; 直到写满 32 字节
+//      jne  loop
+//
+//  按上式逐字节算出（已用脚本在原始 exe 的 .rdata 上代入常量实算）：
+//      ent = 14 AC F1 4B 1A 59 A4 1E 09 16 D6 BD 3D 25 F1 F6
+//            D6 B2 1E A8 77 15 CF 6F 28 B6 A1 80 4E E2 4C 0F
+//
+void entropy32(uint8_t out[32])
+{
+    uint32_t idx_seed = 0x12;   // rcx
+    uint8_t  add_seed = 0x3B;   // dl
+    for (int i = 0; i < 32; i += 2) {
+        out[i]     = (uint8_t)((kTblB[(idx_seed - 0xD) & 0x1F] + add_seed + 0xC5) ^ kTblA[i]);
+        out[i + 1] = (uint8_t)((kTblB[idx_seed & 0x1E]        + add_seed        ) ^ kTblA[i + 1]);
+        idx_seed += 0x1A;
+        add_seed += 0x76;
+    }
+}
+
+// ---- 0x20 字节 CopiedString（String::assign(0x20) 后把栈上 32 字节整块拷进去）----
+// device_tag / pepper 的返回值就是这个二进制串本身，不含任何可读文本。
+// 注意：它是"固定常量"，不是随机数 —— 每次调用输出完全相同（上面的 14ACF14B…）。
+
+// =============================================================================
+//  2. Godot 侧辅助的等价物（原文为引擎内部函数，此处用等价写法表示）
+// =============================================================================
+//  0x2F37B0   String::assign(len)                  —— 分配 len 后返回可写缓冲
+//  0x896840   String::operator=(literal)           —— 字面量赋值（len,ptr）
+//  0x896E90   String::operator+=(String)           —— 追加（据引用计数舞蹈推定）
+//  0x8A65A0   String::utf16()                      —— 转 UTF-16（带分隔符参数）
+//  0x340F9F0  Variant → {length, ptr} 视图         —— 参数拆箱 / 取宽字符指针
+//  0x4198B50  operator new / 0x4198B70 new[] / 0x4198B30 delete / 0x4199EF0 释放
+//  0x2BFE6F0 / 0x2BFF3D0                           —— CryptoCore::SHA256 update / finish
+//  0x6B96A0   Memory::alloc_static 系列            —— 见 0x340F051 处 FATAL 断言串
+//
+//  GDExtension 回调约定（本文件各方法共用）：
+//      rcx = 返回 Variant* 槽
+//      r8  = const Variant* 参数数组（args[0] 的 String 载荷在 [r8+8]，长度在载荷 -0x10）
+//      rdx = 实例指针（本类无状态，方法体内不使用）
+//  返回值经 String::assign(len) 组织后写回返回槽，故脚本侧拿到的是 String / binary String。
+
+// =============================================================================
+//  3. DPAPI 四件套（注意：wrap / unwrap 的命名与 API 是"反"的，这是实测结果）
+// =============================================================================
+
+// -----------------------------------------------------------------------------
+//  device_wrap(0x340DA40)：固定熵 + CryptUnprotectData
+//  ——— 名字叫 wrap，实际做的是"解保护"。
+// -----------------------------------------------------------------------------
+String device_wrap(const String &in)
+{
+    uint8_t ent[32];
+    entropy32(ent);                                    // 同上生成器
+
+    DATA_BLOB entropy   = { 0x20, ent };
+    DATA_BLOB inBlob    = { (DWORD)in.length(), (BYTE *)in.ptr() };
+    DATA_BLOB outBlob   = { 0, nullptr };
+
+    String ret;
+    // 0x340DB39  call [CRYPT32!CryptUnprotectData]
+    //   pDataIn, ppszDataDescr = NULL（不取描述）, pOptionalEntropy = {0x20, ent},
+    //   pvReserved = 0, pPromptStruct = 0, dwFlags = 1 (CRYPTPROTECT_UI_FORBIDDEN)
+    if (CryptUnprotectData(&inBlob, nullptr, &entropy, nullptr, nullptr, 1, &outBlob)) {
+        ret = String::from_buffer(outBlob.pbData, outBlob.cbData);   // 0x340DB4E String::assign(cbData)
+    }
+    if (outBlob.pbData) LocalFree(outBlob.pbData);                   // 0x340DBFC KERNEL32!LocalFree
+
+    // 失败路径：Godot FATAL 断言链（alloc_static / _alloc_exact / ptrw / cowdata.h）
+    // 对应 0x340D... 处的 _err_print + ud2，说明源码写的是 String::resize() 之类必经 COW 的语句，
+    // 一旦前面失败、长度仍为 0 就会命中。
+    return ret;
+}
+
+// -----------------------------------------------------------------------------
+//  device_unwrap(0x340DCB0)：用 mutex_name() 当熵 + CryptProtectData(desc "ombrel")
+// -----------------------------------------------------------------------------
+String device_unwrap(const String &in)
+{
+    String mach = mutex_name();                        // 0x340DCB0 起先 call 0x340F6E0
+    if (mach.empty()) return String();                 // test al,al 失败即短路返回
+
+    DATA_BLOB entropy   = { (DWORD)mach.length(), (BYTE *)mach.ptr() };  // 熵不再是 32 字节常量
+    DATA_BLOB inBlob    = { (DWORD)in.length(), (BYTE *)in.ptr() };
+    DATA_BLOB outBlob   = { 0, nullptr };
+
+    String ret;
+    // 0x340DD61  call [CRYPT32!CryptProtectData]，szDesc = L"ombrel"(@0x50A2FF6)，dwFlags = 1
+    if (CryptProtectData(&inBlob, kDescOmbrel, &entropy, nullptr, nullptr, 1, &outBlob)) {
+        ret = String::from_buffer(outBlob.pbData, outBlob.cbData);
+    }
+    if (outBlob.pbData) LocalFree(outBlob.pbData);                   // 0x340DE17
+    return ret;
+}
+
+// -----------------------------------------------------------------------------
+//  device_wrap_m(0x340DED0)：mutex_name 熵 + CryptUnprotectData + 释放前清零
+//  与 device_wrap 的差别只有两点：熵来源换成本机 mutex_name，明文缓冲先抹零再 LocalFree。
+// -----------------------------------------------------------------------------
+String device_wrap_m(const String &in)
+{
+    String mach = mutex_name();
+    if (mach.empty()) return String();
+
+    DATA_BLOB entropy = { (DWORD)mach.length(), (BYTE *)mach.ptr() };
+    DATA_BLOB inBlob  = { (DWORD)in.length(),  (BYTE *)in.ptr() };
+    DATA_BLOB outBlob = { 0, nullptr };
+
+    String ret;
+    // 0x340DF7C  call [CRYPT32!CryptUnprotectData]
+    if (CryptUnprotectData(&inBlob, nullptr, &entropy, nullptr, nullptr, 1, &outBlob)) {
+        ret = String::from_buffer(outBlob.pbData, outBlob.cbData);  // 0x340DF95
+    }
+    if (outBlob.pbData) {
+        memset(outBlob.pbData, 0, outBlob.cbData);                  // rep stosb：多出的这一步
+        SecureZeroMemory(&outBlob, sizeof(outBlob));                // [推定] 结构体一并清零
+        LocalFree(outBlob.pbData);                                  // 0x340E043
+    }
+    return ret;
+}
+
+// -----------------------------------------------------------------------------
+//  device_unwrap_m(0x340E0F0)：最复杂的一个
+//  体顺序：Variant 解包(0x6C3DE0 / vtable+0x160 / 0x6C5400 / vtable+0x268)
+//          → 内联调用 device_wrap(0x340DA40)
+//          → 字符串处理链(0x1026850 / 0x1026BA0 / 0x1026CC0 / 0x1026A70)
+//          → String::assign(0x20) 组返回
+//  说明：这四条 0x10xxxxx 是 String / Variant 的辅助例程（拼接、编码、类型判定），
+//        尚未逐个定性，故此处只保留调用次序与数据流向，不臆造具体语义。
+// -----------------------------------------------------------------------------
+String device_unwrap_m(const Variant &v)
+{
+    // [推定] 先把入参规约成 String：Variant 可能给 String / StringName / PackedByteArray
+    String s = VariantToString(v);                       // 0x6C3DE0 起的一串
+    String wrapped = device_wrap(s);                      // 内联 0x340DA40
+    // 后续 0x1026850 / 0x1026BA0 / 0x1026CC0 / 0x1026A70：
+    //   典型的 "去前缀 / 取某段 / 编码校验 / 长度对齐" 组合，结果写进 0x20 长度的返回串
+    String ret;
+    ret = postprocess(wrapped);                           // [推定] 语义待确认
+    return ret;
+}
+
+// =============================================================================
+//  4. 标识类：device_tag / pepper
+//    两者在二进制里解析到同一段函数体（0x340E890），行为完全一致：
+//    无参、返回 32 字节固定二进制串。
+// =============================================================================
+
+// device_tag / pepper 共同实现（0x340E890；pepper 的注册指针落在函数中部，语义等价）
+String device_identity_blob()
+{
+    uint8_t ent[32];
+    entropy32(ent);
+    // 0x340E8B7 call 0x2F37B0 → String::assign(32)
+    //   随后 movaps xmm0,[rsp+0x60] / movaps xmm1,[rsp+0x70] 两段 16 字节整块写入
+    return String::from_buffer(ent, 32);   // 载荷即上面那串 14ACF14B…
+}
+
+String device_tag()  { return device_identity_blob(); }
+String pepper()     { return device_identity_blob(); }
+
+// -----------------------------------------------------------------------------
+//  audio_output_identity(0x340D7E0)：固定熵当"熵"，把固定串自身用 DPAPI 保护后返回
+//  熵 = entropy32()，明文 = 同一段 32 字节，descr = "ombrel"，flags = 1
+//  也就是说：返回的是"对本机 DPAPI 环境绑定过的一段常量"，可用来识别"同一个用户环境"。
+// -----------------------------------------------------------------------------
+String audio_output_identity()
+{
+    uint8_t ent[32];
+    entropy32(ent);
+
+    DATA_BLOB entropy = { 0x20, ent };
+    DATA_BLOB inBlob  = { 0x20, ent };                       // 明文与熵同源
+    DATA_BLOB outBlob = { 0, nullptr };
+
+    String ret;
+    // 0x340D8DE  call [CRYPT32!CryptProtectData]，szDesc = L"ombrel"，dwFlags = 1
+    if (CryptProtectData(&inBlob, kDescOmbrel, &entropy, nullptr, nullptr, 1, &outBlob)) {
+        ret = String::from_buffer(outBlob.pbData, outBlob.cbData);   // 0x340D8F3
+    }
+    if (outBlob.pbData) LocalFree(outBlob.pbData);                    // 0x340D990
+    return ret;
+}
+
+// =============================================================================
+//  5. 注册表三件套（全部写死在 HKEY_LOCAL_MACHINE 下，因此需要管理员权限）
+// =============================================================================
+
+// -----------------------------------------------------------------------------
+//  reg_write(0x340EA70)
+//  实测拼装：lpSubKey = "Software\"(9 字符,自带反斜杠) + <串a> + "\"(0x50A300E) + <串b>
+//  三条拼接依次是 0x896840(literal) / 0x896E90(String) / 0x896840(literal) / 0x896E90(String)，
+//  中间夹引用计数拷贝，即典型的 String += 链。
+//
+//  RegCreateKeyExW(HKLM, lpSubKey, 0, 0, 0, samDesired, 0, &hKey, 0)
+//      hKey        = 0xFFFFFFFF80000001 (HKEY_LOCAL_MACHINE)
+//      samDesired  = 0x20006          (KEY_READ|KEY_WRITE|0x10000 —— 实测立即数)
+//      phkResult   = &[rsp+0x48]
+//  然后取 args[0] 的 String 原始载荷（ptr / len）当 lpData / cbData，
+//      RegSetValueExW(hKey, lpValueName, 0, REG_BINARY(3), lpData, cbData)
+//      —— 值内容就是脚本传进来的二进制原样落盘，不做任何序列化/字符串化。
+//  RegCloseKey → sete sil（RegSetValueExW 返回 0 才算成功）
+// -----------------------------------------------------------------------------
+bool reg_write(const String &a, const String &b, const String &value_name, const String &data)
+{
+    String subKey = kRegRoot;                 // "Software\"
+    subKey += a;                              // 0x340EAA8  += String
+    subKey += kSepBackslash;                  // 0x340EB07  += L"\"
+    subKey += b;                              // 0x340EB50  += String
+
+    HKEY hKey = nullptr;
+    DWORD disp = 0;
+    // 0x340EC11  RegCreateKeyExW
+    LONG rc = RegCreateKeyExW(HKEY_LOCAL_MACHINE, (const wchar_t *)subKey.utf16(),
+                              /*Reserved*/0, /*lpClass*/nullptr,
+                              /*dwOptions*/0, /*samDesired*/0x20006,
+                              /*lpSecurityAttributes*/nullptr, &hKey, &disp);
+    bool ok = false;
+    if (rc == ERROR_SUCCESS) {
+        // 0x340EC1B..0x340EC39：取 args[0] 的 String 载荷 ptr 与 len
+        const void *p   = data.ptr();
+        DWORD       cb  = (DWORD)data.length();
+        // 0x340EC4B  RegSetValueExW(hKey, lpValueName, 0, REG_BINARY, lpData, cbData)
+        LONG rc2 = RegSetValueExW(hKey, (const wchar_t *)value_name.utf16(),
+                                  0, REG_BINARY, (const BYTE *)p, cb);
+        RegCloseKey(hKey);                    // 0x340EC58
+        ok = (rc2 == ERROR_SUCCESS);          // 0x340EC60 sete sil
+    }
+    return ok;
+}
+
+// -----------------------------------------------------------------------------
+//  reg_read(0x340ECE0)
+//  同样的路径拼装（0x340ED2C / 0x340ED37 / 0x340ED97 / 0x340EDE0）
+//  → 0x340EE90 RegOpenKeyExW
+//  → 0x340EED3 RegQueryValueExW（先取类型/长度，再取数据，典型的二段查询）
+//  → 0x340EF02 String::assign(len) 组串返回
+//  值名同 reg_write，来自被拆箱的 Variant。
+// -----------------------------------------------------------------------------
+String reg_read(const String &a, const String &b, const String &value_name)
+{
+    String subKey = kRegRoot;
+    subKey += a;
+    subKey += kSepBackslash;
+    subKey += b;
+
+    HKEY hKey = nullptr;
+    // 0x340EE90  RegOpenKeyExW(HKLM, subKey, 0, KEY_READ, &hKey)
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, (const wchar_t *)subKey.utf16(),
+                      0, KEY_READ, &hKey) != ERROR_SUCCESS)
+        return String();
+
+    DWORD type = 0, cb = 0;
+    // 0x340EED3  第一段：拿 cbData
+    RegQueryValueExW(hKey, (const wchar_t *)value_name.utf16(), nullptr, &type, nullptr, &cb);
+
+    String ret;
+    if (cb) {
+        // 0x340EF02  String::assign(cb) → 直接拿可写缓冲做输出区
+        BYTE *buf = (BYTE *)ret.resize_uninitialized(cb);
+        DWORD cb2 = cb;
+        // 0x340EFC8  第二段：真取数据
+        RegQueryValueExW(hKey, (const wchar_t *)value_name.utf16(), nullptr,
+                         &type, buf, &cb2);
+    }
+    RegCloseKey(hKey);                        // 0x340EFD3
+    return ret;
+}
+
+// -----------------------------------------------------------------------------
+//  reg_erase(0x340EF00)
+//  ⚠ 重点结论：该函数体内【没有任何删除类 API】。
+//     导入表中不存在 RegDeleteValueW / RegDeleteKeyW，调用点也只有
+//     0x340EFC8 RegQueryValueExW + 0x340EFD3 RegCloseKey。
+//     函数入口前的地址（<0x340EF00）先做了 RegOpenKeyExW，之后只做"查询 + 关闭"，
+//     返回值取 rsi（0x340F03D mov rax,rsi）。
+//     → 因此"erase"这个行为在方法体里没有落地：要么擦除由调用方替换成
+//       "写空值"（RegSetValueExW cbData=0，本段未见），要么方法名与实现不符。
+//       这一条已列入附录 B 待确认项，不做臆造。
+// -----------------------------------------------------------------------------
+bool reg_erase(const String &a, const String &b, const String &value_name)
+{
+    String subKey = kRegRoot;
+    subKey += a;
+    subKey += kSepBackslash;
+    subKey += b;
+
+    HKEY hKey = nullptr;
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, (const wchar_t *)subKey.utf16(),
+                      0, KEY_READ, &hKey) != ERROR_SUCCESS)
+        return false;
+
+    DWORD type = 0, cb = 0;
+    LONG rc = RegQueryValueExW(hKey, (const wchar_t *)value_name.utf16(),
+                               nullptr, &type, nullptr, &cb);   // 仅探测存在性
+    RegCloseKey(hKey);
+    return (rc == ERROR_SUCCESS);                                // [推定为"存在"的真值]
+}
+
+// =============================================================================
+//  6. 文件 / 进程工具
+// =============================================================================
+
+// -----------------------------------------------------------------------------
+//  flush_file(0x340F320)：对已存在文件做一次落盘（fsync 语义）
+//  String::utf16()(0x8A65A0) + 拆箱(0x340F9F0) 得宽字符路径 →
+//  CreateFileW(path, GENERIC_WRITE=0x40000000, share=7, NULL, OPEN_EXISTING=3,
+//              FILE_ATTRIBUTE_NORMAL=0x80) → FlushFileBuffers → CloseHandle
+//  cmp rax,-1 判失败（INVALID_HANDLE_VALUE），setne sil 返回
+// -----------------------------------------------------------------------------
+bool flush_file(const String &path)
+{
+    HANDLE h = CreateFileW((const wchar_t *)path.utf16(),
+                           GENERIC_WRITE,                       // 0x40000000
+                           FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, // 7
+                           nullptr,
+                           OPEN_EXISTING,                       // 3
+                           FILE_ATTRIBUTE_NORMAL,               // 0x80
+                           nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;                // cmp rax,-1
+    BOOL ok = FlushFileBuffers(h);                              // 0x340F3BB
+    CloseHandle(h);                                             // 0x340F3C6
+    return ok != 0;                                             // setne sil
+}
+
+// -----------------------------------------------------------------------------
+//  move_file_durable(0x340F400)：带写穿透的改名/移动
+//  两次 String::utf16()(0x8A65A0，r8=0x50A3010 '/', r9=0x50A300E '\') + 拆箱得 from/to
+//  MoveFileExW(from, to, flags=8) —— 8 = MOVEFILE_WRITE_THROUGH
+//  注意：没有 MOVEFILE_REPLACE_EXISTING(1)，所以目标存在时必然失败。
+// -----------------------------------------------------------------------------
+bool move_file_durable(const String &from, const String &to)
+{
+    bool ok = MoveFileExW((const wchar_t *)from.utf16(),           // rdx
+                          (const wchar_t *)to.utf16(),             // rcx
+                          MOVEFILE_WRITE_THROUGH) != 0;            // r8d = 8
+    return ok;                                                     // 0x340F50C setne al
+}
+
+// -----------------------------------------------------------------------------
+//  single_instance_acquire(0x340F520)：以 mutex_name() 命名的单实例锁
+//  CreateMutexW(nullptr, TRUE, name)（edx=1 → bInitialOwner = TRUE）
+//  失败(rax==0)        → bl = 1（视为"允许继续"）
+//  成功 → GetLastError()==0xB7(ERROR_ALREADY_EXISTS) → setne bl（已存在则 false）
+//  注意：这是"命名信号量"式用法 —— 句柄用完没有保存，靠内核对象存活期间判重。
+// -----------------------------------------------------------------------------
+bool single_instance_acquire()
+{
+    String mach = mutex_name();                       // 0x340F52A 拆箱取名字
+    HANDLE h = CreateMutexW(nullptr, TRUE, (const wchar_t *)mach.utf16());  // 0x340F53B
+    if (h == nullptr) return true;                    // 0x340F566 mov bl,1
+    bool first = (GetLastError() != ERROR_ALREADY_EXISTS);   // 0xB7 → 0x340F54C cmp eax,0xb7
+    return first;                                     // setne bl
+}
+
+// =============================================================================
+//  7. 常量方法（5 个，全是 String::operator=(literal) 直接返回）
+// =============================================================================
+String is_release_template() { return String(kIsReleaseTemplate); }   // "release"
+String flavor()              { return String(kFlavor); }              // "Ombrel"
+String vendor()              { return String(kVendor); }              // "Cache"
+String reg_subkey()          { return String(kRegSubkey); }           // "cache"
+String cache_dir()           { return String(kCacheDir); }            // "Local\Ombrel.{GUID}"
+
+// =============================================================================
+//  8. mutex_name(0x340F6E0) —— 393 行方法体，全类最核心的一个
+//     全流程实测（地址逐条对应 _impl_all.asm:1814-1993）：
+//       GetCurrentProcess → OpenProcessToken(TOKEN_QUERY=8)          @0x340F6FA / 0x340F70D
+//       GetTokenInformation(TokenUser=1, NULL) 取长度 → [rsp+0x34]  @0x340F73D
+//       分配 → 再取 TOKEN_USER{SID_AND_ATTRIBUTES}                    @0x340F780
+//       CloseHandle → IsValidSid → GetLengthSid → r14d                @0x340F78D-7AF
+//       分配 (GetLengthSid + 0x2D) 字节：0x2D = 32(熵块) + 13("xiewa-machine")
+//         → [rsp+0x40]/[rsp+0x48]
+//       ★ 熵生成器写前 32 字节到 [r15] / [r15+0x10]                   @0x340F830 循环
+//       ★ 再写两个 8 字节常量：                                        @0x340F88F / 0x340F89D
+//           [r15+0x20] = 0x616D2D6177656978 → 小端字节 "xiewa-ma"
+//           [r15+0x25] = 0x656E696863616D2D → 小端字节 "-machine"
+//           两者重叠 3 字节，最终落成 13 字符： "xiewa" + "-machine" = "xiewa-machine"
+//         - 之所以出现重叠写，是编译器把 13 字符常量拆成两个 8 字节立即数，
+//           第二个从 +0x25 起覆盖，净效果是 "xiewa-machine"
+//       ★ SID 字节拷到 [r15+0x2D]                                   @0x340F8B5 operator new[]
+//       然后组 SHA-256 上下文：IV 从 0x50A2E60/0x50A2E70 装入(0x50A2E60 实测=标准 IV)
+//         → 0x2BFE6F0 按 0x40 字节块 update（cmp rdi,0x40）            @0x340F936
+//         → 0x2BFF3D0 finish，结果写进返回 String                     @0x340F971
+//         → rep stosb 0x6C 字节把上下文清零                            @0x340F97D
+//       返回 = hex(SHA-256( 32B熵块 + "xiewa-machine" + SID进制字节 ))
+//     这意味着：同一台机器同一用户，mutex_name() 恒为同一个 64 位十六进制串；
+//     换用户/换机器就变 —— 而 _m 系列方法的 DPAPI 熵正是它，所以 _m 数据天然绑机绑用户。
+// =============================================================================
+String mutex_name()
+{
+    // --- 取当前进程 Token 的 User SID ---
+    HANDLE token = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token))
+        return String();                                   // 0x340F715 je → 返回 0
+
+    DWORD need = 0;
+    GetTokenInformation(token, TokenUser, nullptr, 0, &need);   // 第一段：取长度
+    if (need == 0) {                                           // 0x340F749 je
+        CloseHandle(token);
+        return String();
+    }
+    // 分配 + 真取（原文用 0x6B96A0 = Memory 分配器，缓冲区 16 字节头 + 数据）
+    TOKEN_USER *tu = (TOKEN_USER *)alloc_static(need);          // 0x340F75E
+    if (!GetTokenInformation(token, TokenUser, tu, need, &need)) {  // 0x340F780
+        CloseHandle(token);
+        free_static(tu);
+        return String();
+    }
+    CloseHandle(token);                                        // 0x340F78D
+
+    PSID sid = tu->User.Sid;                                   // [rax]
+    if (!IsValidSid(sid)) {                                    // 0x340F7A2
+        free_static(tu);
+        return String();
+    }
+    DWORD sidLen = GetLengthSid(sid);                          // 0x340F7AF → r14d
+
+    // --- 组装缓冲：32B 熵 + "xiewa-machine" + SID ---
+    uint32_t total = sidLen + 0x2D;                            // 0x2D = 45 = 32 + 13
+    uint8_t *buf = (uint8_t *)alloc_static(total);             // 0x340F7CE
+    entropy32(buf);                                            // 前 32 字节（movaps 整块写）
+    // 两个重叠的 8 字节立即数，净效果 "xiewa-machine"
+    memcpy(buf + 0x20, "xiewa-ma", 8);
+    memcpy(buf + 0x25, "-machine", 8);
+    memcpy(buf + 0x2D, sid, sidLen);                           // 0x340F8B5 new[] + 拷贝
+
+    // --- SHA-256(buf, total) ---
+    SHA256Ctx ctx;
+    memcpy(ctx.h, kSha256IV, 32);                              // 0x340F8E9 / 0x340F8F8
+    ctx.len = (uint32_t)total;                                 // [rsp+0xC0] = edi
+    for (uint32_t off = 0; off < total; off += 0x40)           // cmp rdi,0x40 分块
+        sha256_update(&ctx, buf + off, min(0x40u, total - off));   // 0x2BFE6F0
+
+    String ret;
+    sha256_finish_to_string(&ctx, ret);                        // 0x2BFF3D0 → hex 字符串
+    memset(&ctx, 0, 0x6C);                                     // rep stosb 0x6C
+    free_static(buf);
+    free_static(tu);
+    return ret;                                                // 成功路径 al = 1
+}
+
+// =============================================================================
+//  9. 运行时检测两联
+// =============================================================================
+
+// -----------------------------------------------------------------------------
+//  scan_runtime_detection(0x38F04F0) —— 桩指针直指真实现（不在 0x340Fxxx 桩区）
+//  体：rcx = 返回槽 → 0x3E10170 拆串 → 按 byte[rsp+0x28]&1 判 ptr/内联
+//      → qword[rsi]=0 → 0x8A06F0 造 Variant → 释放临时 → 返回
+//  语义：返回一个"空/否"的 Variant（具体载荷是 0 还是空字典，取决于 0x8A06F0 的实参，
+//        该处尚未逐字节核到，见附录 B）。
+// -----------------------------------------------------------------------------
+Variant scan_runtime_detection()
+{
+    Variant ret;
+    ret = Variant();              // 0x8A06F0 构造，前置 qword[rsi]=0
+    return ret;
+}
+
+// -----------------------------------------------------------------------------
+//  configure_runtime_detection(0x340C721 绑定点)
+//  ⚠ 方法体未定位：它属于"绑定后 mov ecx,0x58; call 0x4198B50 建 0x58 字节对象、
+//    再填 [rsi+0xC]/+0x10/+0x28/+0x38"那一族注册路径，桩指针需继续向下追。
+//    绝不臆造。此处只保留签名占位，见附录 B。
+// -----------------------------------------------------------------------------
+void configure_runtime_detection(const Variant &cfg)
+{
+    // TODO(反汇编): 方法体待定位，0x58 字节对象构造模式，绑定点 0x340C721
+    (void)cfg;
+}
+
+} // namespace xw
+
+// =============================================================================
+//  附录 A —— 方法 / 绑定点 / 桩地址 / 主要 API 对照表
+// -----------------------------------------------------------------------------
+//  方法                      绑定点      桩/实现    主要 API 或常量
+//  configure_runtime_detection 0x340C721 未定位     （见附录 B）
+//  scan_runtime_detection      0x340C841 0x38F04F0  0x3E10170 / 0x8A06F0
+//  audio_output_identity       0x340C888 0x340D7E0  CryptProtectData, "ombrel"
+//  device_wrap                 0x340C8CF 0x340DA40  CryptUnprotectData
+//  device_unwrap               0x340C916 0x340DCB0  mutex_name + CryptProtectData
+//  device_wrap_m               0x340C95D 0x340DED0  mutex_name + CryptUnprotectData + 清零
+//  device_unwrap_m             0x340C9A4 0x340E0F0  device_wrap + 字符串链
+//  device_tag                  0x340CAC1 0x340E890  熵生成器（32B 常量）
+//  pepper                      0x340CBE1 0x340E890  熵生成器（同一函数体）
+//  reg_write                   0x340CD01 0x340EA70  HKLM + RegCreateKeyExW/RegSetValueExW(REG_BINARY)
+//  reg_read                    0x340CE21 0x340ECE0  RegOpenKeyExW/RegQueryValueExW ×2
+//  reg_erase                   0x340CF41 0x340EF00  仅 RegQueryValueExW 探测（无删除 API）
+//  flush_file                  0x340D061 0x340F320  CreateFileW(0x40000000,7,3,0x80)+FlushFileBuffers
+//  move_file_durable           0x340D0A8 0x340F400  MoveFileExW(flags=8 WRITE_THROUGH)
+//  single_instance_acquire     0x340D0EF 0x340F520  CreateMutexW(bInitialOwner=TRUE)+GetLastError(0xB7)
+//  is_release_template         0x340D211 0x340F5A0  "release"
+//  flavor                      0x340D258 0x340F5E0  "Ombrel"
+//  vendor                      0x340D29F 0x340F620  "Cache"
+//  reg_subkey                  0x340D2E6 0x340F660  "cache"
+//  cache_dir                   0x340D32D 0x340F6A0  "Local\Ombrel.{18657BB7-...}"
+//  mutex_name                  0x340D374 0x340F6E0  TokenUser SID + SHA-256
+//
+//  统一的"无状态"证据：类无成员变量；所有方法只做 取参→调 Win32→写回；
+//  数据全部落在 HKLM 注册表、DPAPI 加密串、文件名/缓冲里，不在对象内。
+// =============================================================================
+
+// =============================================================================
+//  附录 B —— 尚未闭环的 4 处（明确标注，不做臆造）
+// -----------------------------------------------------------------------------
+//  B1. configure_runtime_detection 方法体未定位（只有绑定点 0x340C721）。
+//      线索：绑定后紧跟 mov ecx,0x58; call 0x4198B50，即构造 0x58 字节对象，
+//      再填 [obj+0xC]/+0x10/+0x28/+0x38。同一模式的还有 device_unwrap_m、device_tag、
+//      pepper、reg_write、reg_read、reg_erase、single_instance_acquire 的注册路径。
+//      → 需在 IDA 中沿该对象字段继续向下追；或按本报告的"22 行内 lea 追踪"规则放宽窗口。
+//
+//  B2. reg_erase 语义与实现不符。方法体内无任何删除类 API（导入表也没有
+//      RegDeleteValueW / RegDeleteKeyW），只有"开键 + 查值 + 关键"。
+//      → 待确认：是否擦除实际由调用方用 "RegSetValueExW(cbData=0)" 完成（本段未见），
+//        或该方法只是"检查值是否存在"。这也是脚本侧行为最值得实测的一点。
+//
+//  B3. device_unwrap_m 的 0x1026850 / 0x1026BA0 / 0x1026CC0 / 0x1026A70 四条辅助例程
+//      只确认了调用次序，未定性（疑为 String 拼接/编码/类型判定/长度对齐）。
+//
+//  B4. scan_runtime_detection 返回 Variant 的具体载荷（0 还是空容器）取决于
+//      0x8A06F0 的实参，该处尚未逐字节核对。
+// =============================================================================
+//
+//  还原方法说明：
+//    1) 用 capstone 静态反汇编覆盖 20 个桩函数体（_impl_all.asm，1983 行），逐段直读；
+//    2) 用 PE 节表做 RVA→文件偏移，直接读 .rdata 常量（表 A/B、IV、"ombrel"、
+//       重叠的 "xiewa-machine" 两个立即数）；
+//    3) 按反汇编给出的循环步进（rcx+=0x1A, seed+=0x76, &0x1F/&0x1E, +0xC5）
+//       在真实表字节上重算熵块，得到 14ACF14B… 这一串，证明公式与常量都对上；
+//    4) 4 处未闭环在附录 B 明确列出，不以推测填充。
+// =============================================================================

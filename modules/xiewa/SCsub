@@ -1,0 +1,16 @@
+Import("env")
+
+# 把本目录下所有 .cpp 加入模块编译单元（Godot 4.x 写法）
+# 注意：SCsub 会编译目录内全部 *.cpp，所以 _pseudo_backup/ 里的旧伪代码
+# 不能放在这里（已移入子目录，*.cpp 通配不会递归进子目录）。
+env.add_source_files(env.modules_sources, "*.cpp")
+
+# 本模块用到的 Win32 库：
+#   advapi32 —— RegCreateKeyExW / RegOpenKeyExW / RegQueryValueExW / RegDeleteValueW /
+#               RegEnumKeyExW（xiewa_guard.cpp 的注册表三件 + 组C 的 engine_flags）
+#   crypt32  —— CryptProtectData / CryptUnprotectData（组B 的 device_wrap2/unwrap2）
+# kernel32（MoveFileExW / CreateMutexW / GetSystemFirmwareTable / ReadProcessMemory）
+# 由 Godot 主程序默认链接，无需重复声明。
+# user32 不需要（本模块不碰窗口）。
+if env["platform"] == "windows":
+    env.Append(LIBS=["advapi32", "crypt32"])

@@ -1,0 +1,64 @@
+// =============================================================================
+//  XiewaCore.h —— 含 sign_blocked 的第二个原生类的声明级还原
+//
+//  来源 : E:\gamezip\XiewaPai\XiewaPai.exe  (SHA-256 9AF23B57…6B6081)
+//  实现 : 见 XiewaCore.cpp（逐条带 RVA 与反汇编依据）
+//
+//  与第一族 XiewaGuard 的关系：
+//    · 同一个 ClassDB bind API 0xCCE1A0，两条注册流程：
+//        第一族 0x340C600（21 个方法，TLS 初始化 0x17ED0C3 调入）
+//        第二族 0x38F2A50（12 个方法，本文件）
+//    · 本类名在二进制里没有直接读到，按 .rdata 类名区的候选 "XiewaCore" 命名
+// =============================================================================
+
+#pragma once
+#include "core/object/ref_counted.h"
+
+namespace xwc {
+
+// 全局状态（.data，实测地址）
+extern uint32_t g_blockFlagsA;   // 0x5484D98
+extern uint32_t g_blockFlagsB;   // 0x5484D9C
+extern uint32_t g_sigState;      // 0x560AAF4
+
+class XiewaCore : public RefCounted {
+    GDCLASS(XiewaCore, RefCounted);
+
+protected:
+    static void _bind_methods();                  // 0x38F2A50
+
+public:
+    // — 拦截门（8 个方法的共同前导；非绑定方法，仅内部调用）—
+    static bool gate();
+
+    // — 第二套熵（32 字节固定常量 DA1B030D…4E87E354）—
+    static void entropy2(uint8_t out[32]);
+
+    // — DPAPI 四件套（"2"版，desc = "xiewa-dpapi2"）—
+    String  device_wrap2(const String &in);        // 0x38F1970
+    String  device_unwrap2(const String &in);      // 0x38F1B40
+    String  device_wrap_m2(const String &in);      // 0x38F1C70
+    String  device_unwrap_m2(const String &in);    // 0x38F2000
+
+    // — 签名三联 —
+    String  sign2(const String &payload, const String &key);   // 0x38F2050
+    String  derive2(const String &seed);                        // 0x38F2510
+    bool    verify2(const String &lic, const String &sig);      // 0x38F2300
+
+    // — 拦截状态（sign_blocked 就在这里）—
+    int32_t sign_blocked();                        // 0x38F2460
+    bool    test_block();                          // 0x38F8790（置位端）
+
+    // — 环境 —
+    bool    editor_check();                        // 0x38F2DB0
+    int32_t editor_cleanup();                      // 0x38F3250
+    String  name2(const String &channel);          // 0x38F36F0
+};
+
+// 辅助（文件内 static，非绑定）
+void   derive32(uint8_t out[32], const void *in, size_t inLen,
+                const char *salt, size_t saltLen);   // 0x38F12E0
+String dpapi_xfer(const String &in, const uint8_t entropy[32], int dir);  // 0x38F1730
+String machine_key();                                // 0x38F1D70
+
+} // namespace xwc

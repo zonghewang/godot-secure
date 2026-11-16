@@ -1,0 +1,239 @@
+// =============================================================================
+//  XiewaCore.cpp  —— XiewaCore 6 个 core_* 方法的实现级还原
+//
+//  来源 : E:\gamezip\XiewaPai\XiewaPai.exe（SHA256 9AF23B57…B6081）
+//  依据 : _coreimpl.txt（0x3412670 绑定体 + 六个实现体 + 常量串）
+//  标注 : [确认] 反汇编直接可见   [推定] 由调用约定与上下文推断
+// =============================================================================
+
+#include "XiewaCore.h"
+#include "core/string/ustring.h"
+
+namespace xiewa {
+
+// 外部辅助（同模块内）
+String sha256_hex_of(const void *data, size_t len);   // 0x39194E0 哈希 + "0123456789abcdef" hex
+String hmac_sha256_hex(const void *key, size_t klen,
+                       const void *msg, size_t mlen); // 0x391BD00
+
+// =============================================================================
+//  core_version()   绑定点 0x341279E   实现 0x3413190
+// -----------------------------------------------------------------------------
+//  3413190  mov eax, 7
+//  3413195  ret
+// =============================================================================
+int XiewaCore::core_version() {
+    return 7;                                  // [确认] 逐字节可见
+}
+
+// =============================================================================
+//  core_selftest()  绑定点 0x34128DE   实现 0x391A180
+// -----------------------------------------------------------------------------
+//  流程（[确认]）：
+//    1. lea rcx,[rsp+0xc1]；xor edx,edx（len=0）；lea r8,[rsp+0x50]（out 32B）
+//       call 0x39194E0        → SHA-256(空数据)
+//    2. 分配 0x40 字节缓冲（0x35700），用 "0123456789abcdef" 逐字节拼 hex（64 字符）
+//    3. 检查 String 为堆存储（byte&1）且长度 == 0x40
+//    4. memcmp(hex, "e3b0c442…b855", 0x40)    0x4198B60
+//    5. 相等 → eax=1；不等 → eax=0（并把状态码写进 [rsp+0xc0]）
+// =========================================================================
+int XiewaCore::core_selftest() {
+    static const char kExpected[] =
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+    String got = sha256_hex_of(nullptr, 0);        // SHA-256(空) → hex
+    if (got.length() != 64) return 0;              // cmp qword[rsp+0x28],0x40
+    return (got == String(kExpected)) ? 1 : 0;     // memcmp
+}
+
+// =============================================================================
+//  core_sha256_hex(data)  绑定点 0x3412A3A   实现 0x34131B0
+// -----------------------------------------------------------------------------
+//  流程（[确认]）：
+//    mov rsi,rcx                      ; rsi = 返回 String 槽
+//    lea rcx,[rsp+0x28] / xor r8d,r8d / call 0x89FF00   ; 取 String → 窄字节，结果存 [rsp+0x28]
+//    rax=[rsp+0x28]；若非空取 dword[rax-0x10]（长度），dec（Godot 长度带哨兵），movsxd rdi
+//    lea r8,[rsp+0x50] / mov rdx,rdi(=len) / call 0x39194E0   ; SHA-256 → 32B 摘要
+//    分配 0x40 缓冲（0x35700）；用 "0123456789abcdef"（0x491238C? 见下）按 (byte>>4, byte&0xF) 拼 hex
+//    循环 rbx=0..0x20（32 字节）→ 64 字符
+//    mov qword[rsi],0 → String::operator=(0x896840) → 释放临时（0x39D0）
+//    String 引用计数递减（lock dec [rax-0x20]），归零则 operator delete(0x4198B30)
+// =========================================================================
+String XiewaCore::core_sha256_hex(const String &data) {
+    // 0x89FF00：String → 窄字节序列（失败则 len=0）
+    PackedByteArray bytes = string_to_utf8(data);       // 内部：取 [rax-0x10] 长度 - 1
+    size_t len = bytes.size();
+
+    String out = sha256_hex_of(bytes.ptr(), len);       // 32B → 64 字符小写 hex（"0123456789abcdef"）
+    return out;                                         // mov rax,rsi（返回槽）
+}
+
+// =============================================================================
+//  core_shell()     绑定点 0x3412B7E   实现 0x3413300
+// -----------------------------------------------------------------------------
+//  3413300  push rsi / sub rsp,0x30
+//  3413305  mov rsi, rcx                 ; 返回槽
+//  3413308  mov qword ptr [rcx], 0       ; 清零返回 String
+//  341330f  lea rax, [rip + 0x1c902ff]   ; → RVA 0x4EA3615
+//  3413316  mov [rsp+0x20], rax          ; 字面量指针
+//  341331b  mov qword [rsp+0x28], 6      ; 长度 6
+//  3413324  lea rdx,[rsp+0x20] / call 0x896840
+//  341332e  mov rax, rsi / ret
+// =========================================================================
+String XiewaCore::core_shell() {
+    // [确认] 6 字符常量，RVA 0x4EA3615
+    // ⚠ 该地址落在引擎 shader 源码大字符串块内，实际字节为 ".fDepthClipFactor, …"
+    //   前 6 字符 = ".fDept"，语义不通 —— 见 类全表 §6 U3（待运行期确认）
+    return String(".fDept");
+}
+
+// =============================================================================
+//  core_rpc(envelope)  绑定点 0x3412CBE   实现 0x3413340
+// -----------------------------------------------------------------------------
+//  流程（[确认]，按 0x3413340 起的骨架）：
+//     1. 0x89FF00 取入参 String 的窄字节 → [rsp+0xc0]
+//        长度 = dword[rax-0x10]-1（movsxd rdi），cmp rdi,-9 溢出检查，cmp edx,0x16 长路径
+//     2. lea eax,[rdi+rdi]（2*len）→ byte[rsp+0xd8]=al；
+//        rcx=[rsp+0xd9]，0x4199AD0 memcpy(dst,src,len) → byte[rbx+rdi]=0 终止
+//        （即把窄字节串按字节复制，尾部清零）
+//     3. 清 [rsp+0x118] SymbolTable 区（word + 4×16B xmm 清零）
+//     4. 按 byte[rsp+0xd8]&1 选内联/堆指针，算出 begin/end → [rsp+0x30]
+//        call 0x3414B00(&begin, &symtab)         ; 解析（词法+语法，返回 al）
+//        al==0 → 走 0x3413AE1 失败出口
+//     5. 跳过空白：movabs rdx,0x100002600（位图，覆盖 0x20/0x09/0x0A/0x0D 等），
+//        bt rdx,r8；byte>0x20 直接结束
+//     6. 必须恰好消耗完全部输入（rcx==end），且 byte[rsp+0x118]==5（顶层 token 类型必须为 5）
+//     7. 三次取字段（0x34147E0(&out, &symtab, &key, &dst)）：
+//          key "fn"    —— mov byte[rsp+0x30],4；mov word[rsp+0x31],0x6e66（'n','f'）
+//          key "body"  —— mov dword[rsp+0x59],0x79646f62（'b','o','d','y'），长度 8
+//          key "sig"   —— mov dword[rsp+0x71],0x676973（'s','i','g'），长度 6
+//        每次取完释放临时 String（0x39D0）
+//     8. 取到的 fn 值：长度 r9 = byte&1 ? len : inline_len
+//          cmp r9,0xd（13）→ je 0x3413689（13 字符分支）
+//          cmp r9,0x11（17）→ jne 0x34136C2（其它长度 → 失败/默认分支）
+//        17 字符分支：16 字节 + 1 字节与 .rdata 两张表异或：
+//          pxor xmm0, [0x50A358F]；pxor xmm1, [0x50A359F]；por；ptest；jne 0x34136AD（不匹配即拒）
+//          → 匹配则继续构造 body/sig 并进入后续分支
+//     9. 出口返回 JSON 串（.rdata 常量）：
+//          {"ok":0,"err":"sig"}   —— 签名不匹配
+//          {"ok":0,"err":"…"}     —— 其它失败（err 由具体分支填）
+//          {"ok":1}               —— 成功
+//        另有 {"ok":0,"err":"not_qa"}（与 "release"/"qa" 常量配套，QA 构建门）
+// =========================================================================
+String XiewaCore::core_rpc(const String &envelope) {
+    // [确认] 前置：入参转为窄字节（此函数不做 UTF-32 转换，直接按字节拷贝）
+    PackedByteArray bytes = string_to_utf8(envelope);
+    if (bytes.size() >= 9 && bytes.size() > 0x16) {
+        // 超长输入走 0x341363F 的长路径（细节未展开，见 附录 C3）
+    }
+
+    // [确认] 解析
+    ParseResult pr = parse_envelope(bytes);          // 0x3414B00
+    if (!pr.ok) return String("{\"ok\":0,\"err\":\"parse\"}");
+
+    // [确认] 顶层 token 类型必须是 5
+    if (pr.top_type != 5) return String("{\"ok\":0,\"err\":\"parse\"}");
+
+    // [确认] 取三个字段
+    String fn   = pr.get("fn");                      // 0x34147E0
+    String body = pr.get("body");
+    String sig  = pr.get("sig");
+
+    // [确认] fn 长度两路：13 / 17
+    switch (fn.length()) {
+        case 13:
+            // 0x3413689 分支：13 字符 fn（该分支体未逐字节展开）
+            break;
+        case 17: {
+            // 17 字符：与两张 16 字节常量表异或后要求全等
+            if (!xor_equals(fn, 0x50A358F, 0x50A359F)) {
+                return String("{\"ok\":0,\"err\":\"sig\"}");   // 0x34136AD
+            }
+            break;
+        }
+        default:
+            // 0x34136C2：长度不合法
+            return String("{\"ok\":0,\"err\":\"len\"}");
+    }
+
+    // [推定] QA/release 门：常量 "release" / "qa" / "rng_test_seed" 参与分支
+    if (is_qa_build() && !has_rng_test_seed()) {
+        return String("{\"ok\":0,\"err\":\"not_qa\"}");
+    }
+
+    // [确认] 成功模板
+    return String("{\"ok\":1}");
+}
+
+// =============================================================================
+//  core_rules_selftest()  绑定点 0x3412DEE   实现 0x3927060（尾跳目标）
+// -----------------------------------------------------------------------------
+//  流程（[确认]，RFC 4231 Test Case 2 的标准向量）：
+//    lea rcx,"Jefe"（0x494E? 串） / lea r8,"what do ya want for nothing?"
+//    mov edx,4（key 长） / mov r9d,0x1c（data 长 = 28） / call 0x391BD00（HMAC-SHA256）
+//    分配 0x40 缓冲（0x35700），用 "0123456789abcdef" 拼 hex
+//    检查 String 堆存储且长度 == 0x40
+//    memcmp(hex, "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843", 0x40)
+//    相等 → eax=1；不等 → eax=0（0x39271A9 出口）
+//    成功路径继续读全局 0x563CDA8/0x563CDB8 的两个 String（疑似缓存/结果槽），
+//    按 byte&1 判内联/堆，复制到 [rsp+0x30] 后返回
+// =========================================================================
+int XiewaCore::core_rules_selftest() {
+    static const char kExpected[] =
+        "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843";
+
+    String got = hmac_sha256_hex("Jefe", 4,
+                                 "what do ya want for nothing?", 0x1c);
+    if (got.length() != 64) return 0;              // cmp qword[rsp+0x38],0x40
+    return (got == String(kExpected)) ? 1 : 0;     // memcmp
+}
+
+}  // namespace xiewa
+
+// =============================================================================
+//  附录 A —— 地址总表
+// =========================================================================
+#if 0
+XiewaCore::_bind_methods        0x3412670   （0x50 字节 MethodInfo；唯一调用者 0x17ED416）
+注册函数                        0x17ED380   （register_abstract_class；断言 class_db.h:0x113）
+类槽 / 父类槽 / 守卫字节         0x5647840 / 0x5646EE0 / 0x564783C
+
+core_version        绑 0x341279E → 实现 0x3413190   （mov eax,7; ret）
+core_selftest       绑 0x34128DE → 实现 0x391A180   期望 e3b0c442…b855（SHA-256("")）
+core_sha256_hex     绑 0x3412A3A → 实现 0x34131B0   hex 表 "0123456789abcdef"
+core_shell          绑 0x3412B7E → 实现 0x3413300   6 字符字面量 RVA 0x4EA3615
+core_rpc            绑 0x3412CBE → 实现 0x3413340   xor 表 0x50A358F / 0x50A359F
+core_rules_selftest 绑 0x3412DEE → 实现 0x3927060   期望 5bdcc146…ec3843（RFC4231 TC2）
+
+辅助：0x89FF00 String→窄字节 / 0x39194E0 SHA-256 / 0x391BD00 HMAC-SHA256 /
+      0x35700 分配 0x40 缓冲 / 0x896840 String::operator= / 0x4198B60 memcmp /
+      0x39D0 free / 0x4199AD0 memcpy / 0x3414B00 解析器 / 0x34147E0 取字段 /
+      0x4198B30 operator delete
+#endif
+
+// =============================================================================
+//  附录 B —— 关键常量串（.rdata 直读）
+// =========================================================================
+#if 0
+e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855   SHA-256("")
+5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843   HMAC-SHA256("Jefe","what do ya want for nothing?")
+0123456789abcdef                                                   hex 表
+Jefe / what do ya want for nothing?                                RFC4231 向量
+fn / body / sig                                                    core_rpc 字段
+{"ok":0,"err":"sig"} / {"ok":1} / {"ok":0,"err":"not_qa"}           core_rpc 返回模板
+module / rules_load_signed / rng_test_seed / release / qa / test_block
+true / false / null / vector / %.17g
+-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkq…                          内嵌公钥（core_rpc 素材）
+#endif
+
+// =============================================================================
+//  附录 C —— 未闭环
+// =========================================================================
+#if 0
+C1 core_shell 的 6 字符字面量 RVA 0x4EA3615 落在引擎 shader 源码串块内，
+   取到 ".fDept"，语义不通（疑似编译期字面量池复用）。
+C2 core_rpc 的 17 字符 sig 异或表（0x50A358F / 0x50A359F）与相邻 double 1.0 重叠，
+   实际比较值待复核；13 字符分支（0x3413689）与长输入路径（0x341363F、0x341470A）未展开。
+C3 core_rpc 里 "release"/"qa"/"rng_test_seed" 三串参与的分支仅是推断，未逐条对齐。
+C4 core_selftest 成功路径写入的 [rsp+0xc0]=6 状态码（6 可能表示"通过"），未追其消费方。
+#endif
