@@ -18,10 +18,10 @@
 using namespace xiewa;
 
 void XiewaCore::_bind_methods() {
-	ClassDB::bind_method(D_METHOD("core_version"), &XiewaCore::core_version);                                   // 绑定点在 0x3412670 批内，名簇 0x50A35B8 起
-	ClassDB::bind_method(D_METHOD("core_selftest"), &XiewaCore::core_selftest);
-	ClassDB::bind_method(D_METHOD("core_sha256_hex", "data"), &XiewaCore::core_sha256_hex);
-	ClassDB::bind_method(D_METHOD("core_shell"), &XiewaCore::core_shell);
-	ClassDB::bind_method(D_METHOD("core_rpc", "envelope"), &XiewaCore::core_rpc);
-	ClassDB::bind_method(D_METHOD("core_rules_selftest"), &XiewaCore::core_rules_selftest);
+	ClassDB::bind_static_method("XiewaCore", D_METHOD("core_version"), &XiewaCore::core_version);                                   // 绑定点在 0x3412670 批内，名簇 0x50A35B8 起
+	ClassDB::bind_static_method("XiewaCore", D_METHOD("core_selftest"), &XiewaCore::core_selftest);
+	ClassDB::bind_static_method("XiewaCore", D_METHOD("core_sha256_hex", "data"), &XiewaCore::core_sha256_hex);
+	ClassDB::bind_static_method("XiewaCore", D_METHOD("core_shell"), &XiewaCore::core_shell);
+	ClassDB::bind_static_method("XiewaCore", D_METHOD("core_rpc", "envelope"), &XiewaCore::core_rpc);
+	ClassDB::bind_static_method("XiewaCore", D_METHOD("core_rules_selftest"), &XiewaCore::core_rules_selftest);
 }
