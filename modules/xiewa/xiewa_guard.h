@@ -22,6 +22,7 @@
 #pragma once
 
 #include "core/object/ref_counted.h"
+#include "core/variant/dictionary.h"
 #include "core/variant/variant.h"
 
 namespace xiewa {
@@ -72,11 +73,12 @@ public:
     // [确认] 接收配置字典：schema / scan_budget_ms[100,5000] / max_handles[1,0x10000]
     //        / max_processes[1,0x1000] / max_modules[1,0x400] / max_candidates[1,0x20]
     //        / d4_chunk_bytes[8,0x10000] / integrity_baseline(27 键) / known_modules
-    static void configure_runtime_detection(const Variant &cfg);
+    // [修正 2026-11-16] 按 exe 绑定块类型表：argc=1，类型 [返回=BOOL, 参数=DICTIONARY]，defcnt=0
+    static bool configure_runtime_detection(const Dictionary &cfg);
 
     // 绑定 @0x340C841，实现 0x38ECA00 [确认]（驱动 xiewa_guard2d::ImageReader 的镜像校验）
-    // [确认] 拆串 0x3E10170 → 按 byte[rsp+0x28]&1 判 ptr/内联 → Variant 构造 0x8A06F0。
-    static Variant scan_runtime_detection();
+    // [修正 2026-11-16] exe 类型表：argc=1，[返回=DICTIONARY, 参数=DICTIONARY]
+    static Dictionary scan_runtime_detection(const Dictionary &opts);
 
     // 二、设备标识（Windows DPAPI + 运行期熵）
     // 绑定 @0x340C888，实现 0x38F04F0 【地址已修正】
@@ -85,46 +87,55 @@ public:
 
     // 绑定 @0x340C8CF，实现 0x340D7E0 【地址已修正】
     // [待复核·旧注迁入] CRYPT32!CryptProtectData；32 字节熵由 0x50A3100/0x50A3120 两张表现场异或生成。
-    static String device_wrap(const String &in);
+    // [修正 2026-11-16] exe 类型表：argc=1，[返回=PACKED_BYTE_ARRAY, 参数=PACKED_BYTE_ARRAY]
+    static PackedByteArray device_wrap(const PackedByteArray &in);
 
     // 绑定 @0x340C916，实现 0x340DA40 【地址已修正】
     // [待复核·旧注迁入] CRYPT32!CryptUnprotectData（名字与实现相反，名字是脚本侧语义名）。
-    static String device_unwrap(const String &in);
+    // [修正 2026-11-16] exe 类型表：argc=1，[返回=PACKED_BYTE_ARRAY, 参数=PACKED_BYTE_ARRAY]
+    static PackedByteArray device_unwrap(const PackedByteArray &in);
 
     // 绑定 @0x340C95D，实现 0x340DCB0 【地址已修正】
     // [待复核·旧注迁入] mutex_name() 取熵 + CRYPT32!CryptProtectData（szDescription="ombrel"）。
-    static Variant device_wrap_m(const String &in);
+    // [修正 2026-11-16] exe 类型表：argc=1，[返回=PACKED_BYTE_ARRAY, 参数=PACKED_BYTE_ARRAY]
+    static PackedByteArray device_wrap_m(const PackedByteArray &in);
 
     // 绑定 @0x340C9A4，实现 0x340DED0 【地址已修正】
     // [待复核·旧注迁入] 熵 + Unprotect + rep stosb 清零（擦除版）。
-    static Variant device_unwrap_m(const Variant &in);
+    // [修正 2026-11-16] exe 类型表：argc=1，[返回=PACKED_BYTE_ARRAY, 参数=PACKED_BYTE_ARRAY]
+    static PackedByteArray device_unwrap_m(const PackedByteArray &in);
 
     // 绑定 @0x340CAC1，实现 0x340E0F0（1938 B）【地址已修正 + 分体确认】
     // [待复核·旧注迁入] Variant 解包 → 内联 device_wrap → 0x1026850/0x1026BA0/0x1026CC0/0x1026A70 → String::assign(0x20)。
     // 与 pepper 不再是同一体：pepper 走 0x340E890，只 461 B。
-    static String device_tag();
+    // [修正 2026-11-16] exe 类型表：argc=1，[返回=STRING, 参数=STRING]
+    static String device_tag(const String &seed);
 
     // 绑定 @0x340CBE1，实现 0x340E890（461 B）【地址已修正 + 分体确认】
     // [待复核·旧注迁入] 无参无系统调用：异或生成器生成固定 32 字节，String::assign(0x20) 拷出。
-    static String pepper();
+    // [修正 2026-11-16] exe 类型表：argc=0，[返回=PACKED_BYTE_ARRAY]（32 字节原始数据）
+    static PackedByteArray pepper();
 
     // 三、注册表（HKLM，REG_BINARY）
     // 绑定 @0x340CD01，实现 0x340EA60 【地址已修正】
     // [确认] "Software\" + 串a + "\" + 串b → RegCreateKeyExW(HKLM, samDesired=0x20006)
     //        → RegSetValueExW(REG_BINARY=3) → RegCloseKey → sete sil
-    static bool reg_write(const String &name, const String &value);
+    // [修正 2026-11-16] exe 类型表：argc=4，[返回=BOOL, 参数=STRING,STRING,STRING,PACKED_BYTE_ARRAY]
+    static bool reg_write(const String &subkey, const String &name, const String &value,
+            const PackedByteArray &data);
 
     // 绑定 @0x340CE21，入口 0x340ECE0
     // [确认] 同路径拼装 → RegOpenKeyExW → RegQueryValueExW 两段 → String::assign
-    static String reg_read(const String &name);
+    // [修正 2026-11-16] exe 类型表：argc=3，[返回=PACKED_BYTE_ARRAY, 参数=STRING,STRING,STRING]
+    static PackedByteArray reg_read(const String &subkey, const String &name, const String &fallback);
 
     // 绑定 @0x340CF41，实现 0x340F0F0（559 B）【地址已修正 + 真体已复核】
     // [确认] 拼 "Software\" + a + "\" + b（0x50A3004 / 0x50A300E），转宽字符(0x340F9F0)
     //        → RegOpenKeyExW(HKEY_CURRENT_USER=0xFFFFFFFF80000001, key, 0, KEY_SET_VALUE=2, &hk)
     //        → RegDeleteValueW(hk, b) → RegCloseKey(hk)；开键成功且删值成功才 true。
     // ⚠ 旧结论"名实不符 / 无删除 API / HKLM"是读错位址(0x340EF00)所得，全部作废。
-    // ⚠ 参数应为 2 个串（旧声明只有 name），待调用侧确认。
-    static bool reg_erase(const String &subkey, const String &value);
+    // [修正 2026-11-16] exe 类型表：argc=3，[返回=BOOL, 参数=STRING,STRING,STRING]
+    static bool reg_erase(const String &subkey, const String &name, const String &value);
 
     // 绑定 @0x340D061，入口 0x340F320
     // [确认] CreateFileW(GENERIC_WRITE=0x40000000, share=7, OPEN_EXISTING=3,
@@ -138,7 +149,9 @@ public:
     // 绑定 @0x340D0EF，入口 0x340F520
     // [确认] CreateMutexW(NULL, bInitialOwner=1, mutex_name())；
     //        创建失败 bl=1（放行）；GetLastError()==0xB7 → setne bl。
-    static bool single_instance_acquire();
+    // [修正 2026-11-16] exe 类型表：argc=1，[返回=BOOL, 参数=STRING]（互斥体名由脚本传入；
+    //   传空串时退回 mutex_name() 的固定 GUID）
+    static bool single_instance_acquire(const String &name);
 
     // 绑定 @0x340D211 / 0x340D258 / 0x340D29F / 0x340D2E6 / 0x340D32D
     // 实现 0x340F590 / 0x340F5A0 / 0x340F5E0 / 0x340F620 / 0x340F660（各 55 B，0x340F590 仅 1 B）
@@ -167,29 +180,47 @@ public:
     // =========================================================================
 
     // 名串 0x51F6579，实现 0x38F1970（285 指令）
-    static String device_wrap2(const String &in);
+    // [修正 2026-11-16] exe 类型表：argc=1，[返回=PACKED_BYTE_ARRAY, 参数=PACKED_BYTE_ARRAY]
+    static PackedByteArray device_wrap2(const PackedByteArray &in);
     // 名串 0x51F6586，实现 0x38F1B40（267）—— 内含第二套异或生成器（四张真表）
-    static String device_unwrap2(const String &in);
+    // [修正 2026-11-16] 同上：[返回=PACKED_BYTE_ARRAY, 参数=PACKED_BYTE_ARRAY]
+    static PackedByteArray device_unwrap2(const PackedByteArray &in);
     // 名串 0x51F6595，实现 0x38F1C70（284）
-    static Variant device_wrap_m2(const String &in);
+    // [修正 2026-11-16] exe 类型表：argc=1，[返回=PACKED_BYTE_ARRAY, 参数=PACKED_BYTE_ARRAY]
+    static PackedByteArray device_wrap_m2(const PackedByteArray &in);
     // 名串 0x51F65A4，实现 0x38F2000（292）
-    static Variant device_unwrap_m2(const Variant &in);
+    // [修正 2026-11-16] exe 类型表：argc=1，[返回=PACKED_BYTE_ARRAY, 参数=PACKED_BYTE_ARRAY]
+    static PackedByteArray device_unwrap_m2(const PackedByteArray &in);
     // 名串 0x51F65B5，实现 0x38F2050（276）—— 时间窗 0x7D0 + 副本扫描 + "save5…" 标签判定
-    static String sign2(const String &in);
+    // [修正 2026-11-16] exe 类型表：argc=3，[返回=PACKED_BYTE_ARRAY, 参数=STRING,PACKED_BYTE_ARRAY,PACKED_BYTE_ARRAY]
+    //   通道名 / 待签数据 / 密钥材料
+    static PackedByteArray sign2(const String &channel, const PackedByteArray &data,
+            const PackedByteArray &key);
     // 名串 0x51F65BB，实现 0x38F2510（265）—— derive32
-    static String derive2(const String &in);
+    // [修正 2026-11-16] exe 类型表：argc=3，[返回=PACKED_BYTE_ARRAY, 参数=STRING,PACKED_BYTE_ARRAY,INT]
+    static PackedByteArray derive2(const String &channel, const PackedByteArray &seed, int rounds);
     // 名串 0x51F65C3，实现 0x38F2300（280）—— 解析 + base64 + SHA-256 + 比对（非 RSA）
-    static Variant verify2(const Variant &in);
+    // [修正 2026-11-16] exe 类型表：argc=4，[返回=BOOL, 参数=STRING,PACKED_BYTE_ARRAY,PACKED_BYTE_ARRAY,PACKED_BYTE_ARRAY]
+    //   （第 4 参类型在 helper 里动态生成，按同类签名补 PACKED_BYTE_ARRAY）
+    static bool verify2(const String &channel, const PackedByteArray &data, const PackedByteArray &sig,
+            const PackedByteArray &key);
     // 名串 0x51F65CB，实现 0x38F2460（270）—— 三块：双标志 / 状态门 / 时间窗+扫描（自带探测器）
-    static bool sign_blocked();
+    // [修正 2026-11-16] exe 类型表：argc=0，[返回=INT] → 返回掩码位：
+    //   0=放行 / 1=双标志 / 2=状态门 / 4=时间窗 / 8=路径可疑（非 0 即视为被拦）
+    static int sign_blocked();
     // 名串 0x51F65D8，实现 0x38F8790（238）—— evatfpall… 副本指纹测试
-    static Variant test_block(const Variant &in);
+    // [修正 2026-11-16] exe 类型表：argc=1，[返回=BOOL, 参数=INT]
+    static bool test_block(int mode);
     // 名串 0x51F65E3，实现 0x38F2DB0（236）
-    static Variant editor_check(const Variant &in);
+    // [修正 2026-11-16] exe 类型表：argc=2，[返回=INT, 参数=STRING,DICTIONARY]
+    //   0 = 放行 / 1 = 被拦 / 2 = 编辑器或 debug 构建
+    static int editor_check(const String &what, const Dictionary &opts);
     // 名串 0x51F65F0，实现 0x38F3250（249）
-    static Variant editor_cleanup(const Variant &in);
+    // [修正 2026-11-16] exe 类型表：argc=1，[返回=INT, 参数=STRING] → 返回删除的文件数
+    static int editor_cleanup(const String &dir);
     // 名串 0x51F65FF，实现 0x38F36F0（270）
-    static String name2(const String &in);
+    // [修正 2026-11-16] exe 类型表：argc=2，[返回=STRING, 参数=STRING,STRING]
+    static String name2(const String &in, const String &suffix);
 
     // =========================================================================
     //  组C —— 桥接 / 授权 / 清单（21 条，绑定函数 0x3910350，绑定点 0x3910471…0x39111B8）
@@ -208,13 +239,17 @@ public:
     // 绑定点 0x3910591，实现 0x3E13260（312）
     // [确认] 走 0x24A80 / 0x3E10A00（PE 读取）；读 "bits" / "high"；按 test bl,0x7f
     //        返回 "bad" / "high" / "none" 之一（可执行完整性状态）
-    static String script_integrity(const Variant &opts);
+    // [修正 2026-11-16] exe 类型表：argc=1，[返回=DICTIONARY, 参数=INT]
+    //   返回 {"status":"bad|high|none","bits":N,"high":N}
+    static Dictionary script_integrity(int flags);
 
     // 绑定点 0x39105D8，实现 0x38F8820（339）
     // [确认] 组路径 "Ombrel"/"Cache" → 调 reg_read(0x340ECE0) → 0x38FA070 →
     //        LOCALAPPDATA / PROGRAMDATA 上做 JSON 读（0x6C23D0 / 0x6CDA20）
     // [推定] 返回引擎侧标记集合（"container"）
-    static Variant engine_flags();
+    // [修正 2026-11-16] exe 类型表：argc=0，[返回=INT] → 标记位掩码
+    //   1=有注册表记录 / 2=有 LOCALAPPDATA 容器 / 4=有 PROGRAMDATA 容器 / 8=模板标记
+    static int engine_flags();
 
     // 绑定点 0x391061F，实现 0x38F7230（327）
     // [确认] RegGetValueW(hive=0xFFFFFFFF80000002, flags=0x10002) +
@@ -225,70 +260,96 @@ public:
     static String machine_fp();
 
     // 绑定点 0x3910655，实现 0x38F7230（与 machine_fp 同体）
-    static String devlimit_state();
+    // [修正 2026-11-16] exe 类型表：argc=0，[返回=DICTIONARY]
+    static Dictionary devlimit_state();
 
     // 绑定点 0x391069C，实现 0x38FBE00（305）
     // [确认] 写字段 "ev" / "at" / "fp"；"at" 用 "%04d-%02d-%02dT%02d:%02d:%02d"；
     //        时间取虚调用 [rax+0x1F8]
-    static Variant devlimit_mark(const Variant &v);
+    // [修正 2026-11-16] exe 类型表：argc=1，[返回=BOOL, 参数=STRING]
+    static bool devlimit_mark(const String &event);
 
     // 绑定点 0x39107C1，实现 0x390E670（221）
     // [确认] 构造 "XIEWA-UNSEAL|" + … + "|M" → 0x890EA40 解析 → 清理 {Ombrel}\Cache 下记录
-    static Variant devlimit_clear(const Variant &v);
+    // [修正 2026-11-16] exe 类型表：argc=2，[返回=BOOL, 参数=STRING,STRING]
+    //   通道/令牌串 + 要清理的键
+    static bool devlimit_clear(const String &token, const String &scope);
 
     // 绑定点 0x3910808，实现 0x38FC640（316）
     // [确认] 键 "all" / "ev" / "first" / "need_d" / "need_n"
-    static Variant defer_note(const Variant &v);
+    // [修正 2026-11-16] exe 类型表：argc=1，[返回=BOOL, 参数=STRING]
+    static bool defer_note(const String &note);
 
     // 绑定点 0x3910921，实现 0x38FF4C0（346）
     // [确认] 全局 0x548B148 首次标志；读 "first" / "need_n" / "need_d"；
     //        按 Variant 类型 switch（cmp ecx,3; ja; jmp rcx 跳表）
-    static Variant defer_boot(const Variant &v);
+    // [修正 2026-11-16] exe 原始绑定 argc=0 / defcnt=0（绑定块 0x3910921 的
+    //   MethodBind::argument_count=0），即原程序没有入参，类型 switch 读全局状态；
+    //   之前还原成 1 参（Variant&）才导致脚本 0 参调用时 release 版取 default_values[-1] 崩溃。
+    //   返回类型按 exe 类型表为 STRING（延迟期返回待处理的 "ev" 串，放行时返回空串）。
+    static String defer_boot();
 
     // 绑定点 0x3910957，实现 0x38FF4C0（与 defer_boot 同体）
-    static Variant defer_state();
+    // [修正 2026-11-16] exe 类型表：argc=0，[返回=DICTIONARY]
+    static Dictionary defer_state();
 
     // 绑定点 0x3910A71，实现 0x3906250（308）
     // [确认] 字段 "container" / "ok" / "changed" / "err" / "ver" / "sig" / "old" / "format"；
     //        Dictionary 查找走 0x7BAAB0；EnterCriticalSection
-    static Variant list_apply(const Variant &v);
+    // [修正 2026-11-16] exe 类型表：argc=1，[返回=DICTIONARY, 参数=PACKED_BYTE_ARRAY]
+    //   容器以字节流传入，内部按 JSON 解成字段
+    static Dictionary list_apply(const PackedByteArray &container);
 
     // 绑定点 0x3910AA7，实现 0x3906250（与 list_apply 同体）
-    static Variant list_state();
+    // [修正 2026-11-16] exe 类型表：argc=0，[返回=DICTIONARY]
+    static Dictionary list_state();
 
     // 绑定点 0x3910BC1，实现 0x390C7E0（135）
     // [确认] CS 包裹；全局 ready 标志 RVA 0x558A6C1（指令 0x390C810 计算得）；返回原始清单串
-    static String list_raw();
+    // [修正 2026-11-16] exe 类型表：argc=0，[返回=PACKED_BYTE_ARRAY]
+    static PackedByteArray list_raw();
 
     // 绑定点 0x3910CE1，实现 0x390C860（101）
     // [确认] CS → 全局标志 0x558A6C1 → 0x898ED0（取实参）/ 0x390C520 / 0x390B240
-    static Variant list_check_profile(const String &profile);
+    // [修正 2026-11-16] exe 类型表：argc=1，[返回=INT, 参数=STRING]
+    //   0=命中 / 1=未命中 / 2=清单不可用
+    static int list_check_profile(const String &profile);
 
     // 绑定点 0x3910D28，实现 0x390CB50（49）
     // [确认] 判 String 有效（内联/堆、"长度-1"、0x70/0x6d 类型码）→ 0x390C520
-    static String id_hash(const String &id);
+    // [修正 2026-11-16] exe 类型表：argc=2，[返回=STRING, 参数=STRING,STRING]
+    static String id_hash(const String &id, const String &salt);
 
     // 绑定点 0x3910E41，实现 0x390CA20（79）
     // [确认] 要求 17 字符（cmp dword[arg-0x10],0x11）→ CS → 比对
-    static Variant list_check_hash(const String &hash);
+    // [修正 2026-11-16] exe 类型表：argc=2，[返回=INT, 参数=STRING,STRING]
+    //   0 = 命中封禁 / 1 = 未命中 / 2 = 清单不可用 / 3 = 格式错误
+    static int list_check_hash(const String &hash, const String &kind);
 
     // 绑定点 0x3910E77，实现 0x390CA20（与 list_check_hash 同体）
-    static Variant svc_verify(const String &sig);
+    // [修正 2026-11-16] exe 类型表：argc=1，[返回=DICTIONARY, 参数=STRING]
+    static Dictionary svc_verify(const String &sig);
 
     // 绑定点 0x3910F25，实现 0x390CA20（同上）
-    static Variant ck_state();
+    // [修正 2026-11-16] exe 类型表：argc=1，[返回=DICTIONARY, 参数=STRING]
+    static Dictionary ck_state(const String &key);
 
     // 绑定点 0x3911051，实现 0x390F1A0（331）
     // [确认] "XIEWA-UNSEAL|" + arg + "|M" → 0x890EA40 → 产出 receipt（"machine"/"receipt"/"ok"）
-    static String unseal_receipt(const String &key);
+    // [修正 2026-11-16] exe 类型表：argc=5，[返回=DICTIONARY, 参数=STRING×5]
+    static Dictionary unseal_receipt(const String &key, const String &machine, const String &salt,
+            const String &channel, const String &extra);
 
     // 绑定点 0x3911171，实现 0x390FFA0（68）
     // [确认] 0x890F8A0 拆分 → 分段比较（cmp r8d,eax / shl r8,2）
-    static bool receipt_ok(const String &receipt, const String &expect);
+    // [修正 2026-11-16] exe 类型表：argc=5，[返回=BOOL, 参数=STRING×5]
+    static bool receipt_ok(const String &receipt, const String &expect, const String &seg,
+            const String &salt, const String &channel);
 
     // 绑定点 0x39111B8，实现 0x3910070（184）
     // [确认] 0x8A2660 + 16 字符切片（r9d=0x10 / 0x895ED0）+ 比较
-    static bool unseal_legacy_ok(const String &receipt);
+    // [修正 2026-11-16] exe 类型表：argc=2，[返回=BOOL, 参数=STRING,STRING]
+    static bool unseal_legacy_ok(const String &receipt, const String &fp);
 };
 
 }  // namespace xiewa

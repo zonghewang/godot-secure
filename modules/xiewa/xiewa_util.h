@@ -310,6 +310,61 @@ inline bool reg_write_string(HKEY p_root, const String &p_path, const String &p_
 	return rc == ERROR_SUCCESS;
 }
 
+// 与 0x340EA60 的 REG_BINARY 分支一致：RegSetValueExW(REG_BINARY=3)
+inline bool reg_write_binary(HKEY p_root, const String &p_path, const String &p_name,
+		const Vector<uint8_t> &p_data) {
+	HKEY hk = nullptr;
+	std::wstring path = wide(p_path);
+	if (RegCreateKeyExW(p_root, path.c_str(), 0, nullptr, 0, KEY_SET_VALUE, nullptr, &hk, nullptr) != ERROR_SUCCESS) {
+		return false;
+	}
+	std::wstring name = wide(p_name);
+	LONG rc = RegSetValueExW(hk, name.empty() ? nullptr : name.c_str(), 0, REG_BINARY /* = 3 */,
+			(const BYTE *)p_data.ptr(), (DWORD)p_data.size());
+	RegCloseKey(hk);
+	return rc == ERROR_SUCCESS;
+}
+
+// 0x340ECE0 的取参形态：REG_BINARY / REG_SZ 都接，统一成字节
+inline bool reg_read_binary(HKEY p_root, const String &p_path, const String &p_name,
+		Vector<uint8_t> &r_out) {
+	HKEY hk = nullptr;
+	std::wstring path = wide(p_path);
+	if (RegOpenKeyExW(p_root, path.c_str(), 0, KEY_READ, &hk) != ERROR_SUCCESS) {
+		return false;
+	}
+	std::wstring name = wide(p_name);
+	DWORD cb = 0;
+	DWORD type = 0;
+	LONG rc = RegQueryValueExW(hk, name.empty() ? nullptr : name.c_str(), nullptr, &type, nullptr, &cb);
+	if (rc != ERROR_SUCCESS || cb == 0) {
+		RegCloseKey(hk);
+		return false;
+	}
+	r_out.resize((int)cb);
+	rc = RegQueryValueExW(hk, name.empty() ? nullptr : name.c_str(), nullptr, &type,
+			(LPBYTE)r_out.ptrw(), &cb);
+	RegCloseKey(hk);
+	if (rc != ERROR_SUCCESS) {
+		r_out.clear();
+		return false;
+	}
+	if (type == REG_SZ || type == REG_EXPAND_SZ) {
+		// UTF-16 → UTF-8
+		std::wstring w((const wchar_t *)r_out.ptr(), (size_t)cb / sizeof(wchar_t));
+		while (!w.empty() && w.back() == 0) {
+			w.pop_back();
+		}
+		String s = narrow(w.c_str(), (int)w.size());
+		Vector<uint8_t> u8;
+		u8.resize(s.length());
+		memcpy(u8.ptrw(), s.utf8().get_data(), (size_t)s.length());
+		r_out = u8;
+	}
+	r_out.resize((int)cb);
+	return true;
+}
+
 // 与 0x340F0F0 完全一致的形状：开键成功 + 删值成功 ⇒ true
 inline bool reg_delete_value(HKEY p_root, const String &p_path, const String &p_value) {
 	HKEY hk = nullptr;

@@ -154,11 +154,11 @@ String system_volume_serial() {
 
 // 0x38EA8E0（4184 B）：schema / scan_budget_ms / max_handles / max_processes /
 // max_modules / max_candidates / d4_chunk_bytes / integrity_baseline / known_modules
-void XiewaGuard::configure_runtime_detection(const Variant &cfg) {
-	if (cfg.get_type() != Variant::DICTIONARY) {
-		return;
+bool XiewaGuard::configure_runtime_detection(const Dictionary &cfg) {
+	if (cfg.is_empty()) {
+		return false;
 	}
-	Dictionary d = cfg;
+	const Dictionary &d = cfg;
 
 	if (d.has("schema")) {
 		String s = d["schema"];
@@ -195,10 +195,15 @@ void XiewaGuard::configure_runtime_detection(const Variant &cfg) {
 	g_rt.have_startup = false;
 	g_rt.consecutive_mismatches = 0;
 	g_rt.confirmed_mismatch = false;
+	return true;
 }
 
 // 0x38ECA00：用已配置的基线跑一次自校验，产出报告字典
-Variant XiewaGuard::scan_runtime_detection() {
+Dictionary XiewaGuard::scan_runtime_detection(const Dictionary &opts) {
+	if (!opts.is_empty()) {
+		// 原程序允许"配置 + 扫描"一次调用：先把配置灌进去
+		configure_runtime_detection(opts);
+	}
 	Dictionary out;
 	out["status"] = String("unavailable");
 	out["confirmed_mismatch"] = false;
@@ -308,80 +313,87 @@ String XiewaGuard::audio_output_identity() {
 
 // =============================================================================
 //  设备封装 / 解封（0x340D7E0 / 0x340DA40 / 0x340DCB0 / 0x340DED0）
+//  [修正 2026-11-16] 载体改为 PackedByteArray（exe 类型表四条都是 [PBA, PBA]）
 // =============================================================================
-String XiewaGuard::device_wrap(const String &in) {
+PackedByteArray XiewaGuard::device_wrap(const PackedByteArray &in) {
+	PackedByteArray out;
 #ifdef WINDOWS_ENABLED
-	CharString u8 = in.utf8();
-	int n = u8.length();
-	Vector<uint8_t> out;
-	out.resize(n);
+	uint8_t ks[32];
+	keystream1(device_tag(String()), ks);
+	out.resize(in.size());
 	uint8_t *w = out.ptrw();
-	uint8_t ks[32];
-	keystream1(device_tag(), ks);
-	for (int i = 0; i < n; i++) {
-		w[i] = (uint8_t)(u8.get_data()[i] ^ ks[i % 32]);
+	for (int i = 0; i < in.size(); i++) {
+		w[i] = (uint8_t)(in[i] ^ ks[i % 32]);
 	}
-	return String("XW1:") + util::b64_encode(out);
 #else
-	return in;
+	out = in;
 #endif
+	return out;
 }
 
-String XiewaGuard::device_unwrap(const String &in) {
+PackedByteArray XiewaGuard::device_unwrap(const PackedByteArray &in) {
+	PackedByteArray out;
 #ifdef WINDOWS_ENABLED
-	if (!in.begins_with("XW1:")) {
-		return String();
-	}
-	Vector<uint8_t> raw = util::b64_decode(in.substr(4));
-	if (raw.size() == 0) {
-		return String();
-	}
 	uint8_t ks[32];
-	keystream1(device_tag(), ks);
-	Vector<uint8_t> plain;
-	plain.resize(raw.size());
-	uint8_t *w = plain.ptrw();
-	for (int i = 0; i < raw.size(); i++) {
-		w[i] = (uint8_t)(raw[i] ^ ks[i % 32]);
+	keystream1(device_tag(String()), ks);
+	out.resize(in.size());
+	uint8_t *w = out.ptrw();
+	for (int i = 0; i < in.size(); i++) {
+		w[i] = (uint8_t)(in[i] ^ ks[i % 32]);
 	}
-	return String::utf8((const char *)plain.ptr(), plain.size());
 #else
-	return in;
+	out = in;
 #endif
+	return out;
 }
 
-// 带元信息的封装：data 密文 / tag 设备标签前缀 / v 版本
-Variant XiewaGuard::device_wrap_m(const String &in) {
-	Dictionary d;
-	d["v"] = 1;
-	d["tag"] = device_tag().substr(0, 16);
-	d["data"] = device_wrap(in);
-	return d;
-}
-
-// 接受 Dictionary 或 String 两种输入
-Variant XiewaGuard::device_unwrap_m(const Variant &in) {
-	if (in.get_type() == Variant::STRING) {
-		String s = in;
-		return device_unwrap(s);
+// 带元信息的封装：字节容器 = [0]=版本(1) / [1..16]=设备标签前 16 字节 / [17..]=密文
+PackedByteArray XiewaGuard::device_wrap_m(const PackedByteArray &in) {
+	PackedByteArray out;
+#ifdef WINDOWS_ENABLED
+	PackedByteArray cipher = device_wrap(in);
+	String tag = device_tag(String()).substr(0, 16);
+	out.resize(1 + 16 + cipher.size());
+	uint8_t *w = out.ptrw();
+	w[0] = 1;
+	for (int i = 0; i < 16; i++) {
+		w[1 + i] = i < tag.length() ? (uint8_t)tag[i] : 0;
 	}
-	if (in.get_type() == Variant::DICTIONARY) {
-		Dictionary d = in;
-		if (!d.has("data")) {
-			return Variant();
+	for (int i = 0; i < cipher.size(); i++) {
+		w[17 + i] = cipher[i];
+	}
+#else
+	out = in;
+#endif
+	return out;
+}
+
+// 接受带标签的容器（>=17 字节）或裸密文两种输入
+PackedByteArray XiewaGuard::device_unwrap_m(const PackedByteArray &in) {
+#ifdef WINDOWS_ENABLED
+	if (in.size() >= 17 && in[0] == 1) {
+		PackedByteArray cipher;
+		cipher.resize(in.size() - 17);
+		for (int i = 0; i < cipher.size(); i++) {
+			cipher.set(i, in[17 + i]);
 		}
-		return device_unwrap((String)d["data"]);
+		return device_unwrap(cipher);
 	}
-	return Variant();
+#endif
+	return device_unwrap(in);
 }
 
 // =============================================================================
 //  设备标签 / pepper（0x340E0F0 1938 B / 0x340E890 461 B）
 //  实测两者长度差 4 倍，不是同一个函数
 // =============================================================================
-String XiewaGuard::device_tag() {
+String XiewaGuard::device_tag(const String &seed) {
 #ifdef WINDOWS_ENABLED
 	String acc;
+	// 脚本传入的 seed 作为前导材料（原程序 argc=1）
+	if (!seed.is_empty()) {
+		acc += seed + "|";
+	}
 	acc += system_volume_serial() + "|";
 	acc += machine_guid() + "|";
 	acc += String::num_int64(OS::get_singleton()->get_processor_count()) + "|";
@@ -395,54 +407,89 @@ String XiewaGuard::device_tag() {
 	util::sha256(u8.get_data(), (size_t)u8.length(), d);
 	return util::to_hex32(d);
 #else
+	(void)seed;
 	return String("unavailable");
 #endif
 }
 
-String XiewaGuard::pepper() {
-	String seed = device_tag() + "|" + vendor() + "|ombrel-pepper";
+PackedByteArray XiewaGuard::pepper() {
+	String seed = device_tag(String()) + "|" + vendor() + "|ombrel-pepper";
 	uint8_t d[32];
 	CharString u8 = seed.utf8();
 	util::sha256(u8.get_data(), (size_t)u8.length(), d);
-	return util::to_hex32(d);
+	PackedByteArray out;
+	out.resize(32);
+	uint8_t *w = out.ptrw();
+	memcpy(w, d, 32);
+	return out;
 }
 
 // =============================================================================
 //  注册表三件（0x340EA60 / 0x340ECE0 / 0x340F0F0）
 // =============================================================================
-bool XiewaGuard::reg_write(const String &name, const String &value) {
+bool XiewaGuard::reg_write(const String &subkey, const String &name, const String &value,
+		const PackedByteArray &data) {
 #ifdef WINDOWS_ENABLED
-	String path = "Software\\" + vendor() + "\\" + reg_subkey();
+	// 0x340EA60：路径 = "Software\" + subkey（subkey 为空时退回 vendor\reg_subkey）
+	String path = subkey.is_empty() ? String("Software\\") + vendor() + "\\" + reg_subkey()
+									: String("Software\\") + subkey;
+	if (data.size() > 0) {
+		Vector<uint8_t> raw;
+		raw.resize(data.size());
+		memcpy(raw.ptrw(), data.ptr(), (size_t)data.size());
+		return util::reg_write_binary(HKEY_CURRENT_USER, path, name, raw);
+	}
 	return util::reg_write_string(HKEY_CURRENT_USER, path, name, value);
 #else
+	(void)subkey;
 	(void)name;
 	(void)value;
+	(void)data;
 	return false;
 #endif
 }
 
-String XiewaGuard::reg_read(const String &name) {
+PackedByteArray XiewaGuard::reg_read(const String &subkey, const String &name, const String &fallback) {
+	PackedByteArray out;
 #ifdef WINDOWS_ENABLED
-	String path = "Software\\" + vendor() + "\\" + reg_subkey();
-	String v;
-	if (util::reg_read_string(HKEY_CURRENT_USER, path, name, v)) {
-		return v;
+	String path = subkey.is_empty() ? String("Software\\") + vendor() + "\\" + reg_subkey()
+									: String("Software\\") + subkey;
+	Vector<uint8_t> raw;
+	if (util::reg_read_binary(HKEY_CURRENT_USER, path, name, raw) && raw.size() > 0) {
+		out.resize((int)raw.size());
+		memcpy(out.ptrw(), raw.ptr(), (size_t)raw.size());
+		return out;
 	}
-	return String();
 #else
+	(void)subkey;
 	(void)name;
-	return String();
 #endif
+	// 未命中时把回退串按 UTF-8 字节返回（原程序 argc=3 的第 3 参就是这个用途）
+	if (!fallback.is_empty()) {
+		CharString u8 = fallback.utf8();
+		out.resize(u8.length());
+		memcpy(out.ptrw(), u8.get_data(), (size_t)u8.length());
+	}
+	return out;
 }
 
 // 0x340F0F0（559 B）：HKCU + KEY_SET_VALUE(2) + RegDeleteValueW；
 // "Software\" + subkey 为路径，value 为值名，两步都成功才 true
-bool XiewaGuard::reg_erase(const String &subkey, const String &value) {
+bool XiewaGuard::reg_erase(const String &subkey, const String &name, const String &value) {
 #ifdef WINDOWS_ENABLED
-	String path = "Software\\" + subkey;
-	return util::reg_delete_value(HKEY_CURRENT_USER, path, value);
+	String path = subkey.is_empty() ? String("Software\\") + vendor() + "\\" + reg_subkey()
+									: String("Software\\") + subkey;
+	// 原程序 argc=3：名字与值都可能用到，先按 name 删，失败再退 value
+	if (util::reg_delete_value(HKEY_CURRENT_USER, path, name)) {
+		return true;
+	}
+	if (!value.is_empty() && !util::reg_delete_value(HKEY_CURRENT_USER, path, value)) {
+		return false;
+	}
+	return !value.is_empty();
 #else
 	(void)subkey;
+	(void)name;
 	(void)value;
 	return false;
 #endif
@@ -503,13 +550,15 @@ bool XiewaGuard::move_file_durable(const String &from, const String &to) {
 // =============================================================================
 //  单实例（0x340F520）：CreateMutexW 的第三参就是 mutex_name() 的固定 GUID
 // =============================================================================
-bool XiewaGuard::single_instance_acquire() {
+bool XiewaGuard::single_instance_acquire(const String &name) {
 #ifdef WINDOWS_ENABLED
 	if (g_instance_mutex != nullptr) {
 		return true;
 	}
-	std::wstring name = util::wide(mutex_name());
-	HANDLE h = CreateMutexW(nullptr, TRUE, name.c_str());
+	// 原程序 argc=1：互斥体名由脚本给；空串时退回 mutex_name() 的固定 GUID
+	String mtx = name.is_empty() ? mutex_name() : name;
+	std::wstring wname = util::wide(mtx);
+	HANDLE h = CreateMutexW(nullptr, TRUE, wname.c_str());
 	if (h == nullptr) {
 		return false;
 	}
@@ -521,6 +570,7 @@ bool XiewaGuard::single_instance_acquire() {
 	g_instance_mutex = h;
 	return true;
 #else
+	(void)name;
 	return true;
 #endif
 }

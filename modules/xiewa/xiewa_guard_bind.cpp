@@ -78,7 +78,7 @@ void XiewaGuard::_bind_methods() {
 	ClassDB::bind_static_method("XiewaGuard", D_METHOD("devlimit_mark", "v"), &XiewaGuard::devlimit_mark);                              // 绑定 0x391069C  实现 0x38FBE00
 	ClassDB::bind_static_method("XiewaGuard", D_METHOD("devlimit_clear", "v"), &XiewaGuard::devlimit_clear);                            // 绑定 0x39107C1  实现 0x390E670
 	ClassDB::bind_static_method("XiewaGuard", D_METHOD("defer_note", "v"), &XiewaGuard::defer_note);                                    // 绑定 0x3910808  实现 0x38FC640
-	ClassDB::bind_static_method("XiewaGuard", D_METHOD("defer_boot", "v"), &XiewaGuard::defer_boot);                                    // 绑定 0x3910921  实现 0x38FF4C0
+	ClassDB::bind_static_method("XiewaGuard", D_METHOD("defer_boot"), &XiewaGuard::defer_boot);                                          // 绑定 0x3910921  实现 0x38FF4C0；原始 argc=0/defcnt=0（无入参、无默认值）
 	ClassDB::bind_static_method("XiewaGuard", D_METHOD("defer_state"), &XiewaGuard::defer_state);                                       // 绑定 0x3910957  实现 0x38FF4C0（同体）
 	ClassDB::bind_static_method("XiewaGuard", D_METHOD("list_apply", "v"), &XiewaGuard::list_apply);                                    // 绑定 0x3910A71  实现 0x3906250
 	ClassDB::bind_static_method("XiewaGuard", D_METHOD("list_state"), &XiewaGuard::list_state);                                         // 绑定 0x3910AA7  实现 0x3906250（同体）

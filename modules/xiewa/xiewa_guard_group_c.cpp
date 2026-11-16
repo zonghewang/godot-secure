@@ -178,92 +178,121 @@ int XiewaGuard::bridge_check(int flags) {
 // =============================================================================
 //  script_integrity（0x3E13260）
 //  真身就是 xiewa_guard2d 那套自校验，返回 "bits"/"high"/"container"
-//  这里按观测到的三值语义折算成字符串
+//  [修正 2026-11-16] exe 类型表：argc=1，[返回=DICTIONARY, 参数=INT]
 // =============================================================================
-String XiewaGuard::script_integrity(const Variant &opts) {
+Dictionary XiewaGuard::script_integrity(int flags) {
 	Dictionary cfg;
-	if (opts.get_type() == Variant::DICTIONARY) {
-		cfg = opts;
-	}
+	cfg["flags"] = flags;
 	Dictionary r = xiewa_guard2d::impl::script_integrity_impl(cfg);
 	int bits = r.has("bits") ? (int)(int64_t)r["bits"] : 0;
 	int high = r.has("high") ? (int)(int64_t)r["high"] : (bits & 0x7F);
 
+	Dictionary out;
+	out["bits"] = bits;
+	out["high"] = high;
+	out["flags"] = flags;
 	if ((bits & 0x7F) == 0 && high == 0) {
-		return String("bad");
+		out["status"] = String("bad");
+	} else if (high != 0) {
+		out["status"] = String("high");
+	} else {
+		out["status"] = String("none");
 	}
-	if (high != 0) {
-		return String("high");
-	}
-	return String("none");
+	return out;
 }
 
 // =============================================================================
 //  engine_flags（0x38F8820）
 //  "Ombrel"/"Cache" → reg_read → JSON 读 LOCALAPPDATA / PROGRAMDATA → 标记集合
+//  [修正 2026-11-16] exe 类型表：argc=0，[返回=INT]
+//   1=有注册表记录 / 2=有 LOCALAPPDATA 容器 / 4=有 PROGRAMDATA 容器 / 8=release 模板
 // =============================================================================
-Variant XiewaGuard::engine_flags() {
-	Dictionary out;
-	out["container"] = Array();
-	out["reg"] = reg_read("engine_flags");
+int XiewaGuard::engine_flags() {
+	int flags = 0;
 
-	Array dirs;
-	dirs.push_back(OS::get_singleton()->get_data_path());
+	PackedByteArray reg = reg_read(String("Cache"), String("engine_flags"), String());
+	if (reg.size() > 0) {
+		flags |= 1;
+	}
+
+	String data_dir = OS::get_singleton()->get_data_path();
+	if (!data_dir.is_empty() && DirAccess::dir_exists_absolute(data_dir)) {
+		flags |= 2;
+	}
 #ifdef WINDOWS_ENABLED
 	{
 		wchar_t prog[512];
 		DWORD n = GetEnvironmentVariableW(L"ProgramData", prog, 512);
 		if (n > 0) {
-			out["program_data"] = util::narrow(prog, (int)n);
+			String pd = util::narrow(prog, (int)n);
+			if (DirAccess::dir_exists_absolute(pd)) {
+				flags |= 4;
+			}
 		}
 	}
 #endif
-	out["dirs"] = dirs;
-	out["ver"] = 7;
-	return out;
+	if (is_release_template()) {
+		flags |= 8;
+	}
+	return flags;
 }
 
 // =============================================================================
 //  machine_fp / devlimit_state（0x38F7230，两方法同体）
+//  [修正 2026-11-16] devlimit_state 的 exe 类型表是 [返回=DICTIONARY]
 // =============================================================================
 String XiewaGuard::machine_fp() {
 	return machine_fp_impl();
 }
 
-String XiewaGuard::devlimit_state() {
-	return machine_fp_impl();
+Dictionary XiewaGuard::devlimit_state() {
+	Dictionary out;
+	out["fp"] = machine_fp_impl();
+	Array recs;
+	String dir = cache_root();
+	Ref<DirAccess> da = DirAccess::open(dir);
+	if (da.is_valid()) {
+		da->list_dir_begin();
+		String f = da->get_next();
+		while (!f.is_empty()) {
+			if (!da->current_is_dir() && f.begins_with("devlimit")) {
+				Ref<FileAccess> fa = FileAccess::open(dir.path_join(f), FileAccess::READ);
+				if (fa.is_valid()) {
+					Variant parsed;
+					JSON j;
+					if (j.parse(fa->get_as_text()) == OK) {
+						parsed = j.get_data();
+						recs.push_back(parsed);
+					}
+				}
+			}
+			f = da->get_next();
+		}
+		da->list_dir_end();
+	}
+	out["records"] = recs;
+	out["count"] = recs.size();
+	out["ok"] = true;
+	return out;
 }
 
 // =============================================================================
 //  devlimit_mark（0x38FBE00）：写 ev / at / fp 三个字段
+//  [修正 2026-11-16] exe 类型表：argc=1，[返回=BOOL, 参数=STRING]
 // =============================================================================
-Variant XiewaGuard::devlimit_mark(const Variant &v) {
-	Dictionary out;
-	out["ok"] = false;
+bool XiewaGuard::devlimit_mark(const String &event) {
+	if (event.is_empty()) {
+		return false;
+	}
 
 	Dictionary rec;
-	String ev;
-	if (v.get_type() == Variant::DICTIONARY) {
-		Dictionary d = v;
-		if (d.has("ev")) {
-			ev = (String)d["ev"];
-		}
-		rec = d;
-	} else if (v.get_type() == Variant::STRING) {
-		ev = v;
-	}
-	if (ev.is_empty()) {
-		out["err"] = String("event");
-		return out;
-	}
-
 	OS::DateTime now = OS::get_singleton()->get_datetime();
 	auto pad2 = [](int p_v) -> String {
 		return p_v < 10 ? String("0") + String::num_int64(p_v) : String::num_int64(p_v);
 	};
 	String at = String::num_int64(now.year) + "-" + pad2(now.month) + "-" + pad2(now.day) + "T" +
 			pad2(now.hour) + ":" + pad2(now.minute) + ":" + pad2(now.second);
-	rec["ev"] = ev;
+	rec["ev"] = event;
 	rec["at"] = at;
 	rec["fp"] = machine_fp_impl();
 
@@ -272,92 +301,95 @@ Variant XiewaGuard::devlimit_mark(const Variant &v) {
 	String path = dir + "/devlimit.txt";
 	Ref<FileAccess> fa = FileAccess::open(path, FileAccess::WRITE);
 	if (fa.is_null()) {
-		out["err"] = String("container");
-		return out;
+		return false;
 	}
 	fa->store_string(JSON::stringify(rec));
 	fa->flush();
-
-	out["ok"] = true;
-	out["at"] = rec["at"];
-	return out;
+	return true;
 }
 
 // =============================================================================
 //  devlimit_clear（0x390E670）："XIEWA-UNSEAL|" + … + "|M" → 清理 Cache 下记录
+//  [修正 2026-11-16] exe 绑定 argc=2：[返回=BOOL, 参数=STRING,STRING]
 // =============================================================================
-Variant XiewaGuard::devlimit_clear(const Variant &v) {
-	Dictionary out;
-	out["ok"] = false;
-	out["cleared"] = 0;
-
-	String token = "XIEWA-UNSEAL|";
-	if (v.get_type() == Variant::STRING) {
-		token = (String)v;
+bool XiewaGuard::devlimit_clear(const String &token, const String &scope) {
+	String t = token;
+	if (!t.begins_with("XIEWA-UNSEAL|")) {
+		// 允许脚本只传裸键，按原程序拼装
+		t = "XIEWA-UNSEAL|" + token + "|M";
 	}
-	if (!token.begins_with("XIEWA-UNSEAL|")) {
-		out["err"] = String("format");
-		return out;
-	}
-
 	String dir = cache_root();
+	(void)scope;
 	Ref<DirAccess> da = DirAccess::open(dir);
-	if (da.is_valid()) {
-		da->list_dir_begin();
-		String f = da->get_next();
-		int n = 0;
-		while (!f.is_empty()) {
-			if (!da->current_is_dir()) {
-				if (DirAccess::remove_absolute(dir.path_join(f)) == OK) {
-					n++;
-				}
-			}
-			f = da->get_next();
-		}
-		da->list_dir_end();
-		out["cleared"] = n;
+	if (da.is_null()) {
+		return false;
 	}
-	out["ok"] = true;
-	return out;
+	da->list_dir_begin();
+	String f = da->get_next();
+	while (!f.is_empty()) {
+		if (!da->current_is_dir()) {
+			DirAccess::remove_absolute(dir.path_join(f));
+		}
+		f = da->get_next();
+	}
+	da->list_dir_end();
+	return true;
 }
 
 // =============================================================================
 //  defer_note / defer_boot / defer_state（0x38FC640 / 0x38FF4C0）
 //  键：all / ev / first / need_d / need_n；defer_boot 与 defer_state 同体
+//  [修正 2026-11-16] defer_note 绑定 argc=1：[返回=BOOL, 参数=STRING]
 // =============================================================================
-Variant XiewaGuard::defer_note(const Variant &v) {
-	Dictionary out;
+bool XiewaGuard::defer_note(const String &note) {
 	if (!g_defer_inited) {
 		g_defer_state = Dictionary();
 		g_defer_inited = true;
 	}
-	if (v.get_type() != Variant::DICTIONARY) {
-		return g_defer_state;
+	if (note.is_empty()) {
+		return false;
 	}
-	Dictionary d = v;
-	for (const char *k : { "all", "ev", "first", "need_d", "need_n" }) {
-		if (d.has(k)) {
-			g_defer_state[k] = d[k];
+	// 文本形式：key=value;key=value（数字自动转 int，true/false 转 bool）
+	Vector<String> pairs = note.split(";");
+	for (int i = 0; i < pairs.size(); i++) {
+		String kv = pairs[i].strip_edges();
+		if (kv.is_empty()) {
+			continue;
+		}
+		int eq = kv.find("=");
+		if (eq <= 0) {
+			// 只有键名：按 "all" 语义整串注入
+			g_defer_state[kv] = true;
+			continue;
+		}
+		String k = kv.substr(0, eq).strip_edges();
+		String val = kv.substr(eq + 1).strip_edges();
+		if (val == "true" || val == "false") {
+			g_defer_state[k] = (val == "true");
+		} else if (val.is_valid_int()) {
+			g_defer_state[k] = (int64_t)val.to_int();
+		} else {
+			g_defer_state[k] = val;
 		}
 	}
-	// all 置位时把其余键一起抄进来（对应 0x38FC640 的展开分支）
-	if (d.has("all") && (bool)d["all"]) {
-		for (int i = 0; i < d.size(); i++) {
-			Variant key = d.get_key_at_index(i);
-			g_defer_state[key] = d.get_value_at_index(i);
-		}
+	// all 置位时把当前状态一起展开（对应 0x38FC640 的展开分支）
+	if (g_defer_state.has("all") && (bool)g_defer_state["all"]) {
+		g_defer_state["defer"] = true;
 	}
-	out = g_defer_state;
-	out["ok"] = true;
-	return out;
+	return true;
 }
 
-Variant XiewaGuard::defer_boot(const Variant &v) {
+// [修正 2026-11-16] exe 类型表：[返回=STRING]（延迟期返回待处理的 "ev" 串，放行时返回空串）
+String XiewaGuard::defer_boot() {
 	// 0x38FF4C0：全局 0x548B148 首次标志 + Variant 类型 switch（cmp ecx,3 / ja / jmp 跳表）
+	// [修正 2026-11-16] 原程序绑定 argc=0，被 switch 的那个 Variant 来自全局状态，
+	//   不是方法入参；这里读 g_defer_state（defer_note 写入的同一份状态）。
 	if (!g_defer_inited) {
 		g_defer_state = Dictionary();
 		g_defer_inited = true;
 	}
+
+	const Variant v = g_defer_state.has("v") ? g_defer_state["v"] : Variant();
 	if (v.get_type() == Variant::DICTIONARY) {
 		Dictionary d = v;
 		for (const char *k : { "first", "need_n", "need_d" }) {
@@ -381,28 +413,56 @@ Variant XiewaGuard::defer_boot(const Variant &v) {
 	if (need_d > 0 && out.has("ev")) {
 		expired = true;
 	}
-	out["defer"] = !(first || need_n == 0 || expired);
+	bool deferred = !(first || need_n == 0 || expired);
+	out["defer"] = deferred;
 	out["ok"] = true;
-	return out;
+	// 返回类型按 exe 是 String：被延期时给出待处理事件名，否则空串
+	if (!deferred) {
+		return String();
+	}
+	return out.has("ev") ? (String)out["ev"] : String("defer");
 }
 
-Variant XiewaGuard::defer_state() {
-	return defer_boot(Variant());
+Dictionary XiewaGuard::defer_state() {
+	if (!g_defer_inited) {
+		g_defer_state = Dictionary();
+		g_defer_inited = true;
+	}
+	String token = defer_boot();
+	Dictionary out = g_defer_state;
+	out["pending"] = token;
+	out["defer"] = !token.is_empty();
+	out["ok"] = true;
+	return out;
 }
 
 // =============================================================================
 //  list_apply / list_state（0x3906250，同体）
 //  字段：container / ok / changed / err / ver / sig / old / format
+//  [修正 2026-11-16] list_apply 绑定 argc=1：[返回=DICTIONARY, 参数=PACKED_BYTE_ARRAY]
+//   容器以字节流入，内部按 JSON 解成字段
 // =============================================================================
-Variant XiewaGuard::list_apply(const Variant &v) {
+Dictionary XiewaGuard::list_apply(const PackedByteArray &container) {
 	Dictionary out = g_list_state;
 	out["ok"] = false;
 
-	if (v.get_type() != Variant::DICTIONARY) {
+	if (container.size() == 0) {
 		out["err"] = String("format");
 		return out;
 	}
-	Dictionary d = v;
+	String text = String::utf8((const char *)container.ptr(), container.size());
+
+	JSON json;
+	if (json.parse(text) != OK) {
+		out["err"] = String("format");
+		return out;
+	}
+	Variant parsed = json.get_data();
+	if (parsed.get_type() != Variant::DICTIONARY) {
+		out["err"] = String("format");
+		return out;
+	}
+	Dictionary d = parsed;
 	if (!d.has("container")) {
 		out["err"] = String("container");
 		return out;
@@ -424,7 +484,7 @@ Variant XiewaGuard::list_apply(const Variant &v) {
 	return out;
 }
 
-Variant XiewaGuard::list_state() {
+Dictionary XiewaGuard::list_state() {
 	Dictionary out = g_list_state;
 	if (out.is_empty()) {
 		load_list();
@@ -435,28 +495,28 @@ Variant XiewaGuard::list_state() {
 }
 
 // =============================================================================
-//  list_raw（0x390C7E0，135 B）：CS 包裹，返回原始清单串
+//  list_raw（0x390C7E0，135 B）：CS 包裹，返回原始清单
+//  [修正 2026-11-16] exe 类型表：[返回=PACKED_BYTE_ARRAY]
 // =============================================================================
-String XiewaGuard::list_raw() {
+PackedByteArray XiewaGuard::list_raw() {
 	if (g_list_raw.is_empty()) {
 		load_list();
 	}
-	return g_list_raw;
+	PackedByteArray out;
+	CharString u8 = g_list_raw.utf8();
+	out.resize(u8.length());
+	memcpy(out.ptrw(), u8.get_data(), (size_t)u8.length());
+	return out;
 }
 
 // =============================================================================
 //  list_check_profile（0x390C860）：按 profile 匹配 bans 里的 k 字段
+//  [修正 2026-11-16] exe 类型表：argc=1，[返回=INT, 参数=STRING]
+//   0=命中 / 1=未命中 / 2=清单不可用
 // =============================================================================
-Variant XiewaGuard::list_check_profile(const String &profile) {
-	Dictionary out;
-	out["ok"] = true;
-	out["match"] = false;
-	out["profile"] = profile;
-
+int XiewaGuard::list_check_profile(const String &profile) {
 	if (g_list_state.is_empty() && !load_list()) {
-		out["ok"] = false;
-		out["err"] = String("unavailable");
-		return out;
+		return 2;
 	}
 	Array bans = list_bans();
 	for (int i = 0; i < bans.size(); i++) {
@@ -467,23 +527,22 @@ Variant XiewaGuard::list_check_profile(const String &profile) {
 		Dictionary b = e;
 		String k = b.has("k") ? (String)b["k"] : String();
 		if (k == profile) {
-			out["match"] = true;
-			out["entry"] = b;
-			break;
+			return 0;
 		}
 	}
-	return out;
+	return 1;
 }
 
 // =============================================================================
 //  id_hash（0x390CB50，49 B）：String 有效性判定 → 摘要内核
+//  [修正 2026-11-16] exe 绑定 argc=2：[返回=STRING, 参数=STRING,STRING]
 // =============================================================================
-String XiewaGuard::id_hash(const String &id) {
+String XiewaGuard::id_hash(const String &id, const String &salt) {
 	if (id.is_empty()) {
 		return String();
 	}
 	uint8_t d[32];
-	CharString u8 = id.utf8();
+	CharString u8 = (salt.is_empty() ? id : (id + "|" + salt)).utf8();
 	util::sha256(u8.get_data(), (size_t)u8.length(), d);
 	return util::to_hex32(d);
 }
@@ -491,20 +550,17 @@ String XiewaGuard::id_hash(const String &id) {
 // =============================================================================
 //  list_check_hash（0x390CA20，79 B）：要求 17 字符（cmp dword[arg-0x10],0x11）
 //  同体：svc_verify / ck_state
+//  [修正 2026-11-16] exe 绑定 argc=2：[返回=INT, 参数=STRING,STRING]
+//  0=命中 / 1=未命中 / 2=清单不可用 / 3=格式错误
 // =============================================================================
-Variant XiewaGuard::list_check_hash(const String &hash) {
-	Dictionary out;
-	out["ok"] = false;
-	out["match"] = false;
-
+int XiewaGuard::list_check_hash(const String &hash, const String &kind) {
+	(void)kind;
 	// 基线 h 字段是 16 字符 + 结尾，故要求 17（含长度校验的历史行为）
 	if (hash.length() != 16 && hash.length() != 17) {
-		out["err"] = String("format");
-		return out;
+		return 3;
 	}
 	if (g_list_state.is_empty() && !load_list()) {
-		out["err"] = String("unavailable");
-		return out;
+		return 2;
 	}
 	Array bans = list_bans();
 	for (int i = 0; i < bans.size(); i++) {
@@ -517,21 +573,24 @@ Variant XiewaGuard::list_check_hash(const String &hash) {
 			continue;
 		}
 		if (util::ct_equal((String)b["h"], hash.substr(0, 16))) {
-			out["match"] = true;
-			out["ok"] = true;
-			out["entry"] = b;
-			return out;
+			return 0;
 		}
 	}
-	out["ok"] = true;
+	return 1;
+}
+
+// 绑定点 0x3910E77，实现 0x390CA20：原程序 argc=1 / [返回=DICTIONARY, 参数=STRING]
+Dictionary XiewaGuard::svc_verify(const String &sig) {
+	Dictionary out;
+	int code = list_check_hash(sig, String());
+	out["ok"] = (code == 0 || code == 1);
+	out["match"] = (code == 0);
+	out["code"] = code;
 	return out;
 }
 
-Variant XiewaGuard::svc_verify(const String &sig) {
-	return list_check_hash(sig);
-}
-
-Variant XiewaGuard::ck_state() {
+// 绑定点 0x3910F25，[返回=DICTIONARY, 参数=STRING]
+Dictionary XiewaGuard::ck_state(const String &key) {
 	Dictionary out;
 	if (g_list_state.is_empty()) {
 		load_list();
@@ -540,29 +599,62 @@ Variant XiewaGuard::ck_state() {
 	out["mode"] = g_list_state.has("mode") ? g_list_state["mode"] : Variant(String("off"));
 	out["ver"] = g_list_state.has("ver") ? g_list_state["ver"] : Variant(0);
 	out["bans"] = list_bans().size();
+	if (!key.is_empty()) {
+		int code = list_check_hash(key, String());
+		out["code"] = code;
+		out["match"] = (code == 0);
+	}
 	return out;
 }
 
 // =============================================================================
 //  unseal_receipt（0x390F1A0，331 B）
 //  "XIEWA-UNSEAL|" + key + "|M" → 0x390EA40 解析 → machine / receipt / ok
+//  [修正 2026-11-16] exe 绑定 argc=5：[返回=DICTIONARY, 参数=STRING×5]
 // =============================================================================
-String XiewaGuard::unseal_receipt(const String &key) {
+Dictionary XiewaGuard::unseal_receipt(const String &key, const String &machine, const String &salt,
+		const String &channel, const String &extra) {
+	Dictionary out;
+	out["ok"] = false;
 	if (key.is_empty()) {
-		return String();
+		out["err"] = String("format");
+		out["receipt"] = String();
+		out["machine"] = String();
+		return out;
 	}
-	String token = "XIEWA-UNSEAL|" + key + "|M";
+	String token = "XIEWA-UNSEAL|" + key;
+	if (!salt.is_empty()) {
+		token += "|" + salt;
+	}
+	if (!channel.is_empty()) {
+		token += "|" + channel;
+	}
+	if (!extra.is_empty()) {
+		token += "|" + extra;
+	}
+	token += "|M";
 	uint8_t mac[32];
-	util::hmac_sha256(pepper(), token, mac);
+	const PackedByteArray pep = pepper();
+	CharString u8 = token.utf8();
+	util::hmac_sha256(pep.ptr(), (size_t)pep.size(), u8.get_data(), (size_t)u8.length(), mac);
 	String receipt = util::to_hex32(mac);
-	return String("machine=") + machine_fp_impl().substr(0, 16) +
-			";receipt=" + receipt + ";ok=1";
+	String fp = machine.is_empty() ? machine_fp_impl() : machine;
+	out["machine"] = fp.substr(0, 16);
+	out["receipt"] = receipt;
+	out["ok"] = true;
+	out["err"] = String();
+	return out;
 }
 
 // =============================================================================
 //  receipt_ok（0x390FFA0，68 B）：0x390F8A0 拆分后分段比较
+//  [修正 2026-11-16] exe 绑定 argc=5：[返回=BOOL, 参数=STRING×5]
 // =============================================================================
-bool XiewaGuard::receipt_ok(const String &receipt, const String &expect) {
+bool XiewaGuard::receipt_ok(const String &receipt, const String &expect, const String &seg,
+		const String &salt, const String &channel) {
+	(void)seg;
+	(void)salt;
+	(void)channel;
 	if (receipt.is_empty() || expect.is_empty()) {
 		return false;
 	}
@@ -582,16 +674,17 @@ bool XiewaGuard::receipt_ok(const String &receipt, const String &expect) {
 
 // =============================================================================
 //  unseal_legacy_ok（0x3910070，184 B）：0x8A2660 + 16 字符切片比较
+//  [修正 2026-11-16] exe 绑定 argc=2：[返回=BOOL, 参数=STRING,STRING]
 // =============================================================================
-bool XiewaGuard::unseal_legacy_ok(const String &receipt) {
+bool XiewaGuard::unseal_legacy_ok(const String &receipt, const String &fp) {
 	if (receipt.length() < 16) {
 		return false;
 	}
-	String fp = machine_fp_impl().substr(0, 16);
-	if (fp.length() < 16) {
+	String expect = fp.is_empty() ? machine_fp_impl().substr(0, 16) : fp.substr(0, 16);
+	if (expect.length() < 16) {
 		return false;
 	}
-	return util::ct_equal(receipt.substr(0, 16), fp);
+	return util::ct_equal(receipt.substr(0, 16), expect);
 }
 
 } // namespace xiewa

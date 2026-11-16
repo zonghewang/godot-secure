@@ -111,8 +111,11 @@ String XiewaCore::core_rpc(const String &envelope) {
 	}
 
 	// 期望签名：HMAC(pepper, fn + "|" + body) 的小写 hex 前 17 位
+	// [修正 2026-11-16] pepper 按 exe 类型表返回 PackedByteArray（32 字节原始熵）
 	uint8_t mac[32];
-	util::hmac_sha256(guard->pepper(), fn + "|" + body, mac);
+	PackedByteArray pep = guard->pepper();
+	CharString msg = (fn + "|" + body).utf8();
+	util::hmac_sha256(pep.ptr(), (size_t)pep.size(), msg.get_data(), (size_t)msg.length(), mac);
 	String expect = util::to_hex32(mac).substr(0, 17);
 	if (!util::ct_equal(sig, expect)) {
 		return String(kRpcSigFail);
