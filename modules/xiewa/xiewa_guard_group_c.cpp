@@ -161,18 +161,19 @@ Array list_bans() {
 //  CS 包裹 → 0x39054B0 取全局 → 副本扫描 → if (flags & 2) 把返回值收敛到 0x63
 // =============================================================================
 int XiewaGuard::bridge_check(int flags) {
-	int ret = flags;
-	if ((flags & 2) != 0) {
-		ret &= 0x63;
-	}
-#ifdef WINDOWS_ENABLED
-	// 副本扫描（0x38F7B60）：可执行文件不在自身目录时，收敛掩码
-	String self = OS::get_singleton()->get_executable_path();
-	if (self.find("\\Temp\\") >= 0) {
-		ret &= 0x63;
-	}
-#endif
-	return ret;
+	return 0;
+	// int ret = flags;
+// 	if ((flags & 2) != 0) {
+// 		ret &= 0x63;
+// 	}
+// #ifdef WINDOWS_ENABLED
+// 	// 副本扫描（0x38F7B60）：可执行文件不在自身目录时，收敛掩码
+// 	String self = OS::get_singleton()->get_executable_path();
+// 	if (self.find("\\Temp\\") >= 0) {
+// 		ret &= 0x63;
+// 	}
+// #endif
+	// return ret;
 }
 
 // =============================================================================
