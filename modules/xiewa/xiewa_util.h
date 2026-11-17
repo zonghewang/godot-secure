@@ -8,6 +8,7 @@
 #pragma once
 
 #include "core/core_bind.h" // Marshalls
+#include "core/io/marshalls.h" // decode_variant
 #include "core/string/ustring.h"
 #include "core/templates/vector.h"
 
@@ -205,6 +206,100 @@ inline Vector<uint8_t> from_hex(const String &p_hex) {
 		i += 2;
 	}
 	return out;
+}
+
+// -----------------------------------------------------------------------------
+//  [修正 2026-11-16] 密文 / 明文的形态判定
+//
+//  0x340D7E0 / 0x38F1970 两代 device_wrap 的产物都是 CryptProtectData 的
+//  DATA_BLOB，头部固定为 01 00 00 00 + provider GUID {df9d8cd0-1501-11d1-...}。
+//  我方解不开（熵来自运行期填充表）时若继续按 XOR 解，会吐出一串"长度相同但
+//  首 4 字节非法"的字节，脚本侧 bytes_to_var() 立刻报
+//      Condition "(header & 0xFF) >= Variant::VARIANT_MAX"
+//  因此解封函数必须先判定形态：DPAPI 形态一律返回空，XOR 产物必须过 Variant 头校验。
+// -----------------------------------------------------------------------------
+inline bool looks_like_dpapi(const uint8_t *p_data, int p_len) {
+	if (p_data == nullptr || p_len < 8) {
+		return false;
+	}
+	static const uint8_t sig[8] = { 0x01, 0x00, 0x00, 0x00, 0xd0, 0x8c, 0x9d, 0xdf };
+	return memcmp(p_data, sig, 8) == 0;
+}
+
+// Variant 序列化流的首 4 字节 = u32 header，低字节为 Variant::Type（< VARIANT_MAX=39）
+inline bool looks_like_variant(const uint8_t *p_data, int p_len) {
+	if (p_data == nullptr || p_len < 5) {
+		return false;
+	}
+	uint32_t header = (uint32_t)p_data[0] | ((uint32_t)p_data[1] << 8) |
+			((uint32_t)p_data[2] << 16) | ((uint32_t)p_data[3] << 24);
+	return (header & 0xFFu) < 39u;
+}
+
+inline bool looks_like_dpapi(const Vector<uint8_t> &p_in) {
+	return looks_like_dpapi(p_in.ptr(), p_in.size());
+}
+
+inline bool looks_like_variant(const Vector<uint8_t> &p_in) {
+	return looks_like_variant(p_in.ptr(), p_in.size());
+}
+
+// 注：PackedByteArray 即 Vector<uint8_t> 的别名，无需另加重载
+
+// -----------------------------------------------------------------------------
+//  [修正 2026-11-17] 静默预筛：脚本侧 device_wrap 包的一直是 var_to_bytes(dict)，
+//  形如 {"b":PBA,"m":PBA[,"v":int]}。先按 marshal 布局做纯字节预筛，
+//  只有通过预筛才真正调用 decode_variant —— 否则 decode_variant 自己会打印
+//      Condition "((int32_t)(count)) < 0 || ..." → ERR_INVALID_DATA  (marshalls.cpp:976)
+//  垃圾字节被送进解码器时会再刷一遍 ERROR，这正是 2026-11-17 日志里新出现的那批。
+//  未类型化 Dictionary 布局：header(4) + count(4) + [key header(4)+u32 len+bytes(+pad)] …
+// -----------------------------------------------------------------------------
+inline uint32_t read_u32le(const uint8_t *p) {
+	return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+inline bool dict_plain_precheck(const uint8_t *p_data, int p_len) {
+	if (p_data == nullptr || p_len < 24) {
+		return false;
+	}
+	uint32_t header = read_u32le(p_data);
+	if ((header & 0xFFu) != 27u) { // Variant::DICTIONARY
+		return false;
+	}
+	uint32_t count = read_u32le(p_data + 4) & 0x7FFFFFFFu;
+	if (count < 1u || count > 16u) {
+		return false;
+	}
+	if ((read_u32le(p_data + 8) & 0xFFu) != 4u) { // 键必须是 String
+		return false;
+	}
+	uint32_t klen = read_u32le(p_data + 12);
+	if (klen != 1u) {
+		return false;
+	}
+	uint8_t k = p_data[16];
+	if (k != 'b' && k != 'm' && k != 'v') { // 脚本固定这三个键
+		return false;
+	}
+	return true;
+}
+
+// 强校验：预筛通过后再用与脚本 bytes_to_var() 完全相同的解码器完整解一遍
+inline bool plain_is_decodable(const uint8_t *p_data, int p_len) {
+	if (!dict_plain_precheck(p_data, p_len)) {
+		return false;
+	}
+	Variant v;
+	int used = 0;
+	Error err = decode_variant(v, p_data, p_len, &used, false, 0);
+	if (err != OK || used != p_len) {
+		return false;
+	}
+	return v.get_type() == Variant::DICTIONARY;
+}
+
+inline bool plain_is_decodable(const Vector<uint8_t> &p_in) {
+	return plain_is_decodable(p_in.ptr(), p_in.size());
 }
 
 // 常量时间比较（避免时序侧信道）

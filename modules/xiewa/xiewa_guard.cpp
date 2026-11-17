@@ -334,12 +334,21 @@ PackedByteArray XiewaGuard::device_wrap(const PackedByteArray &in) {
 PackedByteArray XiewaGuard::device_unwrap(const PackedByteArray &in) {
 	PackedByteArray out;
 #ifdef WINDOWS_ENABLED
+	// [修正 2026-11-16] 原程序 v1 密文是 DPAPI blob（熵来自运行期表），我方解不开；
+	// 直接返回空，让脚本走 "dpapi"/"missing" 分支，而不是吐垃圾字节。
+	if (util::looks_like_dpapi(in)) {
+		return out;
+	}
 	uint8_t ks[32];
 	keystream1(device_tag(String()), ks);
 	out.resize(in.size());
 	uint8_t *w = out.ptrw();
 	for (int i = 0; i < in.size(); i++) {
 		w[i] = (uint8_t)(in[i] ^ ks[i % 32]);
+	}
+	// 解出来必须是 Variant 流，否则视为解不开
+	if (!util::plain_is_decodable(out)) {
+		out = PackedByteArray();
 	}
 #else
 	out = in;
@@ -371,6 +380,10 @@ PackedByteArray XiewaGuard::device_wrap_m(const PackedByteArray &in) {
 // 接受带标签的容器（>=17 字节）或裸密文两种输入
 PackedByteArray XiewaGuard::device_unwrap_m(const PackedByteArray &in) {
 #ifdef WINDOWS_ENABLED
+	// [修正 2026-11-16] 原程序 v1 机器级密文同样是 DPAPI blob，解不开就返回空
+	if (util::looks_like_dpapi(in)) {
+		return PackedByteArray();
+	}
 	if (in.size() >= 17 && in[0] == 1) {
 		PackedByteArray cipher;
 		cipher.resize(in.size() - 17);

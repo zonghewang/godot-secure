@@ -192,18 +192,22 @@ public:
     // [修正 2026-11-16] exe 类型表：argc=1，[返回=PACKED_BYTE_ARRAY, 参数=PACKED_BYTE_ARRAY]
     static PackedByteArray device_unwrap_m2(const PackedByteArray &in);
     // 名串 0x51F65B5，实现 0x38F2050（276）—— 时间窗 0x7D0 + 副本扫描 + "save5…" 标签判定
-    // [修正 2026-11-16] exe 类型表：argc=3，[返回=PACKED_BYTE_ARRAY, 参数=STRING,PACKED_BYTE_ARRAY,PACKED_BYTE_ARRAY]
-    //   通道名 / 待签数据 / 密钥材料
-    static PackedByteArray sign2(const String &channel, const PackedByteArray &data,
-            const PackedByteArray &key);
+    // [修正 2026-11-17] 脚本侧实参顺序是 (label, key, body)：守护.sign2 →
+    //   _native.sign2(label, key, body)，第 2 参是密钥、第 3 参才是待签数据。
+    //   （2026-11-16 版本把两参语义对调，导致写入方与校验方自相矛盾，
+    //     存档水位._serialize 写出的 mac 永远过不了 verify2 → "未提交本次存档"）
+    static PackedByteArray sign2(const String &channel, const PackedByteArray &key,
+            const PackedByteArray &body);
     // 名串 0x51F65BB，实现 0x38F2510（265）—— derive32
     // [修正 2026-11-16] exe 类型表：argc=3，[返回=PACKED_BYTE_ARRAY, 参数=STRING,PACKED_BYTE_ARRAY,INT]
     static PackedByteArray derive2(const String &channel, const PackedByteArray &seed, int rounds);
     // 名串 0x51F65C3，实现 0x38F2300（280）—— 解析 + base64 + SHA-256 + 比对（非 RSA）
     // [修正 2026-11-16] exe 类型表：argc=4，[返回=BOOL, 参数=STRING,PACKED_BYTE_ARRAY,PACKED_BYTE_ARRAY,PACKED_BYTE_ARRAY]
     //   （第 4 参类型在 helper 里动态生成，按同类签名补 PACKED_BYTE_ARRAY）
-    static bool verify2(const String &channel, const PackedByteArray &data, const PackedByteArray &sig,
-            const PackedByteArray &key);
+    // [修正 2026-11-17] 脚本侧实参顺序是 (label, key, body, mac)：守护.verify2 →
+    //   _native.verify2(label, key, body, mac)，与 sign2 的 (label, key, body) 对齐。
+    static bool verify2(const String &channel, const PackedByteArray &key, const PackedByteArray &body,
+            const PackedByteArray &mac);
     // 名串 0x51F65CB，实现 0x38F2460（270）—— 三块：双标志 / 状态门 / 时间窗+扫描（自带探测器）
     // [修正 2026-11-16] exe 类型表：argc=0，[返回=INT] → 返回掩码位：
     //   0=放行 / 1=双标志 / 2=状态门 / 4=时间窗 / 8=路径可疑（非 0 即视为被拦）

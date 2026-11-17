@@ -158,6 +158,10 @@ PackedByteArray XiewaGuard::device_unwrap2(const PackedByteArray &in) {
 	for (int i = 0; i < mixed.size(); i++) {
 		p[i] = (uint8_t)(mixed[i] ^ ks[i % 32]);
 	}
+	// [修正 2026-11-16] 解出来必须能被 decode_variant 完整解码（等价于脚本侧 bytes_to_var 不炸）
+	if (!util::plain_is_decodable(out)) {
+		out = PackedByteArray();
+	}
 #endif
 	return out;
 }
@@ -244,13 +248,13 @@ PackedByteArray XiewaGuard::derive2(const String &channel, const PackedByteArray
 //  sign2（0x38F2050）：HMAC + "save5…" 标签判定 + 时间窗
 //  [修正 2026-11-16] exe 绑定 argc=3：[返回=PACKED_BYTE_ARRAY, 参数=STRING,PACKED_BYTE_ARRAY,PACKED_BYTE_ARRAY]
 // =============================================================================
-PackedByteArray XiewaGuard::sign2(const String &channel, const PackedByteArray &data,
-		const PackedByteArray &key) {
+PackedByteArray XiewaGuard::sign2(const String &channel, const PackedByteArray &key,
+		const PackedByteArray &body) {
 	PackedByteArray out;
 	if (gate()) {
 		return out;
 	}
-	// HMAC 密钥 = pepper 原始 32 字节 ‖ 脚本给的密钥 ‖ 通道标签
+	// HMAC 密钥 = pepper 原始 32 字节 ‖ 脚本给的 key ‖ 通道标签
 	PackedByteArray pep = pepper();
 	Vector<uint8_t> kb;
 	kb.resize(pep.size() + key.size() + 16);
@@ -266,17 +270,17 @@ PackedByteArray XiewaGuard::sign2(const String &channel, const PackedByteArray &
 	memcpy(kw + off, t8.get_data(), (size_t)t8.length());
 	off += t8.length();
 
-	// 待签材料：存档类前缀 save5 时追加 "|save"（与原程序标签判定一致）
+	// 待签材料 = body（存档类前缀 save5 时追加 "|save"）
 	Vector<uint8_t> mb;
-	mb.resize(data.size() + 6);
+	mb.resize(body.size() + 6);
 	uint8_t *mw = mb.ptrw();
-	for (int i = 0; i < data.size(); i++) {
-		mw[i] = data[i];
+	for (int i = 0; i < body.size(); i++) {
+		mw[i] = body[i];
 	}
-	int mlen = data.size();
+	int mlen = body.size();
 	bool is_save = false;
-	if (data.size() >= 5) {
-		const char *p = (const char *)data.ptr();
+	if (body.size() >= 5) {
+		const char *p = (const char *)body.ptr();
 		is_save = (p[0] == 's' && p[1] == 'a' && p[2] == 'v' && p[3] == 'e' && p[4] == '5');
 	}
 	if (is_save) {
@@ -295,22 +299,22 @@ PackedByteArray XiewaGuard::sign2(const String &channel, const PackedByteArray &
 //  verify2（0x38F2300）：解析 + base64 + SHA-256 比对（不是 RSA）
 //  [修正 2026-11-16] exe 绑定 argc=4：[返回=BOOL, 参数=STRING,PACKED_BYTE_ARRAY,PACKED_BYTE_ARRAY,PACKED_BYTE_ARRAY]
 // =============================================================================
-bool XiewaGuard::verify2(const String &channel, const PackedByteArray &data, const PackedByteArray &sig,
-		const PackedByteArray &key) {
+bool XiewaGuard::verify2(const String &channel, const PackedByteArray &key, const PackedByteArray &body,
+		const PackedByteArray &mac) {
 	if (gate()) {
 		return false;
 	}
-	PackedByteArray expect = sign2(channel, data, key);
-	if (expect.size() == 0 || sig.size() == 0) {
+	PackedByteArray expect = sign2(channel, key, body);
+	if (expect.size() == 0 || mac.size() == 0) {
 		return false;
 	}
 	uint8_t eq = 1;
-	size_t n = (size_t)(expect.size() < sig.size() ? expect.size() : sig.size());
-	if (expect.size() != sig.size()) {
+	size_t n = (size_t)(expect.size() < mac.size() ? expect.size() : mac.size());
+	if (expect.size() != mac.size()) {
 		eq = 0;
 	}
 	for (size_t i = 0; i < n; i++) {
-		eq &= (uint8_t)(expect[(int)i] == sig[(int)i]);
+		eq &= (uint8_t)(expect[(int)i] == mac[(int)i]);
 	}
 	return eq != 0;
 }
