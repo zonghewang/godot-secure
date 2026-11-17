@@ -474,15 +474,30 @@ String XiewaGuard::device_tag(const String &seed) {
 #endif
 }
 
+// [修正 2026-11-17] pepper 是**与机器无关的静态生成器**，不是设备指纹派生量。
+//   反汇编 0x14340E890（461 B）：两张 .rdata 表 + 逐两字节摊平
+//     A @ 0x1450A3100 = 8becc2e515384b8d75b902a9da95114d69bb47ceb7d67d4f3f2c5be5eab42b5c
+//     B @ 0x1450A3120 = f6231ea02c9f3a864624d77dfda4b133d330058d8b5decfc2e239ca6058fa7bd
+//     k = 0..15
+//     rax = 1 + 2k ; ecx = 0x12 + 0x1A*k ; dl = 0x3B + 0x76*k
+//     out[rax-1] = (B[((ecx - 0x0D) & 0x1F)] + dl + 0xC5) ^ A[rax-1]
+//     out[rax]   = (B[(ecx & 0x1E)]         + dl)        ^ A[rax]
+//   整体复算 = 14acf14b1a59a41e0916d6bd3d25f1f664b21ea87715cf6f28b6a1804ee24c0f
+//   （与 kEntropyGen1 同值：v1 的 DPAPI 熵正是拿 pepper 当熵）
+//   pepper 是「迁移文件 mac（_kt → hkdf_expand(pepper, …)）」「日志行 mac」的密钥根，
+//   一旦猜错会让所有 HMAC 对不上 —— 迁移导入报「迁移文件校验失败」即由此而来。
+static const uint8_t kPepperBytes[32] = {
+	0x14, 0xAC, 0xF1, 0x4B, 0x1A, 0x59, 0xA4, 0x1E,
+	0x09, 0x16, 0xD6, 0xBD, 0x3D, 0x25, 0xF1, 0xF6,
+	0x64, 0xB2, 0x1E, 0xA8, 0x77, 0x15, 0xCF, 0x6F,
+	0x28, 0xB6, 0xA1, 0x80, 0x4E, 0xE2, 0x4C, 0x0F,
+};
+
 PackedByteArray XiewaGuard::pepper() {
-	String seed = device_tag(String()) + "|" + vendor() + "|ombrel-pepper";
-	uint8_t d[32];
-	CharString u8 = seed.utf8();
-	util::sha256(u8.get_data(), (size_t)u8.length(), d);
 	PackedByteArray out;
 	out.resize(32);
 	uint8_t *w = out.ptrw();
-	memcpy(w, d, 32);
+	memcpy(w, kPepperBytes, 32);
 	return out;
 }
 

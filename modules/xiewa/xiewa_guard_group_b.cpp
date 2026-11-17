@@ -250,51 +250,102 @@ PackedByteArray XiewaGuard::device_unwrap_m2(const PackedByteArray &in) {
 }
 
 // =============================================================================
-//  derive2（0x38F2510）：三段 SHA-256 派生，标签 xw2-derive
-//  [修正 2026-11-16] exe 绑定 argc=3：[返回=PACKED_BYTE_ARRAY, 参数=STRING,PACKED_BYTE_ARRAY,INT]
+//  KDF（0x38F12E0）—— 两段式 SHA-256，模块内所有派生（D / 熵 / derive2）共用
+//    blk(d,s)[i] = (i < |d| ? d[i] : 0) ^ s[i % 16]          // d 截/补到 64 字节
+//    K2(d,t)     = SHA256( blk(d,saltB) ‖ SHA256( blk(d,saltA) ‖ t ) )
+//    saltA = "6666666666666666"(0x51F64B0)  saltB = 16 * 0x5C(0x51F64C0)
+//  ——— 2026-11-17 用原版 derive2 复算 Diao 的 .xwmig mac 完全命中，公式已验证。
+// =============================================================================
+namespace {
+const uint8_t kSaltA[16] = { '6', '6', '6', '6', '6', '6', '6', '6',
+	'6', '6', '6', '6', '6', '6', '6', '6' };
+const uint8_t kSaltB[16] = { 0x5C, 0x5C, 0x5C, 0x5C, 0x5C, 0x5C, 0x5C, 0x5C,
+	0x5C, 0x5C, 0x5C, 0x5C, 0x5C, 0x5C, 0x5C, 0x5C };
+
+void kdf_blk(const uint8_t *d, size_t n, const uint8_t *salt, uint8_t out[64]) {
+	for (size_t i = 0; i < 64; i++) {
+		out[i] = (uint8_t)((i < n ? d[i] : 0) ^ salt[i % 16]);
+	}
+}
+
+void kdf_k2(const uint8_t *d, size_t n, const uint8_t *tag, size_t tag_len, uint8_t out[32]) {
+	uint8_t b_a[64];
+	uint8_t b_b[64];
+	uint8_t inner[32];
+	uint8_t buf[96];
+	kdf_blk(d, n, kSaltA, b_a);
+	kdf_blk(d, n, kSaltB, b_b);
+	memcpy(buf, b_a, 64);
+	if (tag != nullptr && tag_len > 0) {
+		memcpy(buf + 64, tag, tag_len);
+	}
+	util::sha256(buf, 64 + tag_len, inner);
+	memcpy(buf, b_b, 64);
+	memcpy(buf + 64, inner, 32);
+	util::sha256(buf, 96, out);
+}
+} // namespace
+
+// 原版静态材料（都在原版 exe 内部算得，我方 .text 已不同，只能按实测值固化）：
+//   D      = K2(sha256(原版 .text), "xw-bind")   = a645b423…c27c29ba
+//   seed32 = 0x38F0D80 的四表摊平（入参 D）       = 5cff9f8f…1c5a524f
+[[maybe_unused]] const uint8_t kGuardD[32] = {
+	0xA6, 0x45, 0xB4, 0x23, 0xE1, 0xE2, 0x58, 0x35,
+	0xF6, 0x37, 0x30, 0x39, 0xD9, 0x99, 0xBF, 0x07,
+	0x82, 0xCD, 0x27, 0xDE, 0xFD, 0x52, 0x10, 0x20,
+	0x46, 0xBD, 0xB5, 0xA9, 0xC2, 0x7C, 0x29, 0xBA,
+};
+const uint8_t kGuardSeed32[32] = {
+	0x5C, 0xFF, 0x9F, 0x8F, 0x9A, 0x14, 0xEA, 0x70,
+	0xD0, 0x82, 0xFB, 0x8A, 0x0A, 0x2B, 0x57, 0x45,
+	0xE1, 0x70, 0x7D, 0x0F, 0x4C, 0xDB, 0x87, 0x65,
+	0xB6, 0x88, 0x4A, 0x05, 0x1C, 0x5A, 0x52, 0x4F,
+};
+
+// =============================================================================
+//  derive2（0x38F2510）—— 已按反汇编钉死：
+//    ① 材料 mat = KDF( seed32(D), tag = "xw2|" + channel + "|" + seed )   // 0x38F2780
+//    ② 结果     = KDF( mat,       tag = "xw2-derive" )                    // 0x51F656E, len 10
+//  第三节参数只是"输出长度"（脚本恒传 32），原版内部固定出 32 B。
+//  验证：把 Diao 的 XWMIG2 迁移件的 nonce 当 seed 代入，k_mac = hmac 结果与原文件 mac 完全一致。
 // =============================================================================
 PackedByteArray XiewaGuard::derive2(const String &channel, const PackedByteArray &seed, int rounds) {
 	PackedByteArray out;
 	if (gate()) {
 		return out;
 	}
-	if (rounds < 1) {
-		rounds = 3; // 原程序默认段数 3（argc 给了就用给的）
-	}
-	if (rounds > 64) {
-		rounds = 64;
-	}
-	// 种子材料 = channel|seed|ombrel
+	String head = String("xw2|") + channel + "|";
+	CharString h = head.utf8();
+	int hlen = h.length();
 	Vector<uint8_t> buf;
-	buf.resize(0);
-	String prefix = channel + "|" + String(kTagDerive) + "|";
-	CharString pre = prefix.utf8();
-	buf.resize(pre.length() + seed.size() + (int)strlen(kTagOmbrel) + 1);
+	buf.resize(hlen + seed.size());
 	uint8_t *w = buf.ptrw();
-	memcpy(w, pre.get_data(), (size_t)pre.length());
-	int off = pre.length();
+	memcpy(w, h.get_data(), (size_t)hlen);
 	for (int i = 0; i < seed.size(); i++) {
-		w[off + i] = seed[i];
+		w[hlen + i] = seed[i];
 	}
-	off += seed.size();
-	memcpy(w + off, kTagOmbrel, strlen(kTagOmbrel));
-	off += (int)strlen(kTagOmbrel);
 
-	uint8_t cur[32];
-	util::sha256(w, (size_t)off, cur);
-	for (int round = 0; round < rounds; round++) {
-		uint8_t next[32];
-		util::sha256(cur, 32, next);
-		memcpy(cur, next, 32);
-	}
-	out.resize(32);
-	memcpy(out.ptrw(), cur, 32);
+	uint8_t mat[32];
+	kdf_k2(kGuardSeed32, 32, w, (size_t)(hlen + seed.size()), mat);
+	uint8_t res[32];
+	kdf_k2(mat, 32, (const uint8_t *)kTagDerive, strlen(kTagDerive), res);
+
+	int out_len = (rounds > 0 && rounds <= 32) ? rounds : 32;
+	out.resize(out_len);
+	memcpy(out.ptrw(), res, (size_t)out_len);
 	return out;
 }
 
 // =============================================================================
-//  sign2（0x38F2050）：HMAC + "save5…" 标签判定 + 时间窗
-//  [修正 2026-11-16] exe 绑定 argc=3：[返回=PACKED_BYTE_ARRAY, 参数=STRING,PACKED_BYTE_ARRAY,PACKED_BYTE_ARRAY]
+//  sign2（0x38F2050）—— 2026-11-17 按反汇编 + 真实产物实测钉死：
+//    材料 mat = KDF( seed32(D), tag = "xw2|" + label + "|" + key )     // 0x38F2780
+//    结果     = KDF( mat,       tag = body )                          // 0x38F12E0
+//  即 sign2(label, key, body) = K2( K2(seed32(D), "xw2|<label>|<key>"), body )
+//  —— 与 derive2 共用同一材料生成器，只有外层 tag 不同（derive2 是常量 "xw2-derive"）。
+//  label 若恰为 "save5?" 形态，原版先过 0x1439004A0 的专用判定（不改结果）。
+//  验证：Diao 水位信封 {b,m,v:2} 里 m = 8d12fe7c…549c67，
+//        用 label="mark"、key=空、body=信封的 b 字段复算，逐字节命中。
+//  绑定 argc=3：[返回=PACKED_BYTE_ARRAY, 参数=STRING,PACKED_BYTE_ARRAY,PACKED_BYTE_ARRAY]
 // =============================================================================
 PackedByteArray XiewaGuard::sign2(const String &channel, const PackedByteArray &key,
 		const PackedByteArray &body) {
@@ -302,42 +353,22 @@ PackedByteArray XiewaGuard::sign2(const String &channel, const PackedByteArray &
 	if (gate()) {
 		return out;
 	}
-	// HMAC 密钥 = pepper 原始 32 字节 ‖ 脚本给的 key ‖ 通道标签
-	PackedByteArray pep = pepper();
-	Vector<uint8_t> kb;
-	kb.resize(pep.size() + key.size() + 16);
-	uint8_t *kw = kb.ptrw();
-	memcpy(kw, pep.ptr(), (size_t)pep.size());
-	int off = pep.size();
+	String head = String("xw2|") + channel + "|";
+	CharString h = head.utf8();
+	int hlen = h.length();
+	Vector<uint8_t> buf;
+	buf.resize(hlen + key.size());
+	uint8_t *w = buf.ptrw();
+	memcpy(w, h.get_data(), (size_t)hlen);
 	for (int i = 0; i < key.size(); i++) {
-		kw[off + i] = key[i];
-	}
-	off += key.size();
-	String tail = "|" + channel;
-	CharString t8 = tail.utf8();
-	memcpy(kw + off, t8.get_data(), (size_t)t8.length());
-	off += t8.length();
-
-	// 待签材料 = body（存档类前缀 save5 时追加 "|save"）
-	Vector<uint8_t> mb;
-	mb.resize(body.size() + 6);
-	uint8_t *mw = mb.ptrw();
-	for (int i = 0; i < body.size(); i++) {
-		mw[i] = body[i];
-	}
-	int mlen = body.size();
-	bool is_save = false;
-	if (body.size() >= 5) {
-		const char *p = (const char *)body.ptr();
-		is_save = (p[0] == 's' && p[1] == 'a' && p[2] == 'v' && p[3] == 'e' && p[4] == '5');
-	}
-	if (is_save) {
-		memcpy(mw + mlen, "|save", 5);
-		mlen += 5;
+		w[hlen + i] = key[i];
 	}
 
+	uint8_t mat[32];
+	kdf_k2(kGuardSeed32, 32, w, (size_t)(hlen + key.size()), mat);
 	uint8_t mac[32];
-	util::hmac_sha256(kw, (size_t)off, mw, (size_t)mlen, mac);
+	kdf_k2(mat, 32, (const uint8_t *)body.ptr(), (size_t)body.size(), mac);
+
 	out.resize(32);
 	memcpy(out.ptrw(), mac, 32);
 	return out;
@@ -368,40 +399,48 @@ bool XiewaGuard::verify2(const String &channel, const PackedByteArray &key, cons
 }
 
 // =============================================================================
-//  sign_blocked（0x38F2460）：三块 —— 双标志 / 状态门 / 时间窗 + 副本扫描
-//  [修正 2026-11-16] exe 类型表：[返回=INT] → 掩码 1/2/4/8，非 0 即被拦
+//  sign_blocked（0x38F2460，176 B 全量反汇编核对）
+//  原版流程：
+//    if (g_blk_a | g_blk_b)                     return 1;    // ① 双标志
+//    n = (w & 0xE) ? (w & 1) + 2 : (w & 1);                  // ② 状态门（0x560AAF4）
+//    if (n) { g_blk_a |= n;                     return 1; }
+//    now = ticks_usec / 1000;                               // call *0x228 → shr 3 → /1000
+//    if (g_first_tick && now - g_first_tick < 0x7D0) return 0;   // ③ 启动窗口内【放行】
+//    g_first_tick = now ? now : 1;
+//    bits = gate_scan(2) & 0x63;                            // ④ 副本/注入扫描（0x1438F7B60）
+//    if (bits) { g_blk_a |= bits;               return 1; }
+//    return 0;
+//  [修正 2026-11-17] 上一版把 ③ 的方向写反了（写成“窗口内一律拦”）、并且首次调用直接
+//  返回非 0。原版是【窗口内放行、且首次调用本身不被判为拦截】，否则开机早期
+//  local_save_manager::_write_save_file_v4 的 sign_blocked() 检查会误拒写档。
 // =============================================================================
 int XiewaGuard::sign_blocked() {
-	int mask = 0;
-	// ① 双标志
 	if (g_block_a != 0 || g_block_b != 0) {
-		mask |= 1;
+		return 1;
 	}
-	// ② 状态门（0x560AAF4 的位运算）
-	uint64_t w = g_flag_w;
-	uint8_t d = (uint8_t)(w & 1);
-	uint32_t n = (w & 0xE) ? (uint32_t)d + 2 : (uint32_t)d;
+	uint32_t w = (uint32_t)g_flag_w;
+	uint32_t bit0 = w & 1u;
+	uint32_t n = (w & 0xEu) ? (bit0 + 2u) : bit0;
 	if (n != 0) {
 		g_block_a |= (int)n;
-		mask |= 2;
+		return 1;
 	}
-	// ③ 启动后 0x7D0 毫秒内的调用一律拦（防注入时序）
-	if (g_first_tick == 0) {
-		g_first_tick = OS::get_singleton()->get_ticks_msec();
-		mask |= 4;
-		return mask;
+	uint64_t now_ms = (uint64_t)OS::get_singleton()->get_ticks_msec();
+	if (g_first_tick != 0) {
+		if (now_ms - g_first_tick < 0x7D0ull) {
+			return 0; // 启动窗口内：原版放行
+		}
 	}
-	if (OS::get_singleton()->get_ticks_msec() - g_first_tick < 0x7D0) {
-		mask |= 4;
-	}
-	// ④ 副本扫描：exe 出现在系统目录 / Temp
+	g_first_tick = (now_ms == 0) ? 1 : now_ms;
+	// ④ 副本扫描（原版 0x1438F7B60(2) & 0x63）：命中时位掩码累加进 g_block_a，此后永久返回 1
 #ifdef WINDOWS_ENABLED
 	String self = OS::get_singleton()->get_executable_path();
 	if (self.find("\\Windows\\") >= 0 || self.find("\\Temp\\") >= 0) {
-		mask |= 8;
+		g_block_a |= 2;
+		return 1;
 	}
 #endif
-	return mask;
+	return 0;
 }
 
 // =============================================================================
