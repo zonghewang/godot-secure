@@ -272,17 +272,30 @@ void kdf_k2(const uint8_t *d, size_t n, const uint8_t *tag, size_t tag_len, uint
 	uint8_t b_a[64];
 	uint8_t b_b[64];
 	uint8_t inner[32];
-	uint8_t buf[96];
 	kdf_blk(d, n, kSaltA, b_a);
 	kdf_blk(d, n, kSaltB, b_b);
-	memcpy(buf, b_a, 64);
-	if (tag != nullptr && tag_len > 0) {
-		memcpy(buf + 64, tag, tag_len);
+
+	// ★ 2026-11-17 修栈越界：tag 长度可达数 MB（sign2 的第三参就是水位信封 b 字段，
+	//   实测 1,576 B；迁移件 body 更大），原来把 tag 拷进固定 buf[96] 会写穿栈帧，
+	//   覆盖 saved rbp / 返回地址 / __security_cookie，返回时 __security_check_cookie
+	//   失败 → __fastfail(2)（BEX64 / 0xc0000409 / param[0]=2）。
+	//   这里改成流式 SHA-256，拼接语义与 memcpy 版完全等价，结果逐字节相同。
+	{
+		util::Sha256 h;
+		h.start();
+		h.update(b_a, 64);
+		if (tag != nullptr && tag_len > 0) {
+			h.update(tag, tag_len);
+		}
+		h.finish(inner);
 	}
-	util::sha256(buf, 64 + tag_len, inner);
-	memcpy(buf, b_b, 64);
-	memcpy(buf + 64, inner, 32);
-	util::sha256(buf, 96, out);
+	{
+		util::Sha256 h;
+		h.start();
+		h.update(b_b, 64);
+		h.update(inner, 32);
+		h.finish(out);
+	}
 }
 } // namespace
 
