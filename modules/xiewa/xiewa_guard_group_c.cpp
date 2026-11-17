@@ -384,43 +384,43 @@ String XiewaGuard::defer_boot() {
 	// 0x38FF4C0：全局 0x548B148 首次标志 + Variant 类型 switch（cmp ecx,3 / ja / jmp 跳表）
 	// [修正 2026-11-16] 原程序绑定 argc=0，被 switch 的那个 Variant 来自全局状态，
 	//   不是方法入参；这里读 g_defer_state（defer_note 写入的同一份状态）。
-	if (!g_defer_inited) {
-		g_defer_state = Dictionary();
-		g_defer_inited = true;
-	}
+	// if (!g_defer_inited) {
+	// 	g_defer_state = Dictionary();
+	// 	g_defer_inited = true;
+	// }
 
-	const Variant v = g_defer_state.has("v") ? g_defer_state["v"] : Variant();
-	if (v.get_type() == Variant::DICTIONARY) {
-		Dictionary d = v;
-		for (const char *k : { "first", "need_n", "need_d" }) {
-			if (d.has(k)) {
-				g_defer_state[k] = d[k];
-			}
-		}
-	} else if (v.get_type() == Variant::INT) {
-		g_defer_state["need_n"] = v;
-	} else if (v.get_type() == Variant::STRING) {
-		g_defer_state["ev"] = v;
-	}
+	// const Variant v = g_defer_state.has("v") ? g_defer_state["v"] : Variant();
+	// if (v.get_type() == Variant::DICTIONARY) {
+	// 	Dictionary d = v;
+	// 	for (const char *k : { "first", "need_n", "need_d" }) {
+	// 		if (d.has(k)) {
+	// 			g_defer_state[k] = d[k];
+	// 		}
+	// 	}
+	// } else if (v.get_type() == Variant::INT) {
+	// 	g_defer_state["need_n"] = v;
+	// } else if (v.get_type() == Variant::STRING) {
+	// 	g_defer_state["ev"] = v;
+	// }
 
-	Dictionary out = g_defer_state;
-	int need_n = out.has("need_n") ? (int)(int64_t)out["need_n"] : 0;
-	int need_d = out.has("need_d") ? (int)(int64_t)out["need_d"] : 0;
-	bool first = out.has("first") ? (bool)out["first"] : true;
+	// Dictionary out = g_defer_state;
+	// int need_n = out.has("need_n") ? (int)(int64_t)out["need_n"] : 0;
+	// int need_d = out.has("need_d") ? (int)(int64_t)out["need_d"] : 0;
+	// bool first = out.has("first") ? (bool)out["first"] : true;
 
-	// 延期判定：首次运行或期限已到都放行
-	bool expired = false;
-	if (need_d > 0 && out.has("ev")) {
-		expired = true;
-	}
-	bool deferred = !(first || need_n == 0 || expired);
-	out["defer"] = deferred;
-	out["ok"] = true;
-	// 返回类型按 exe 是 String：被延期时给出待处理事件名，否则空串
-	if (!deferred) {
+	// // 延期判定：首次运行或期限已到都放行
+	// bool expired = false;
+	// if (need_d > 0 && out.has("ev")) {
+	// 	expired = true;
+	// }
+	// bool deferred = !(first || need_n == 0 || expired);
+	// out["defer"] = deferred;
+	// out["ok"] = true;
+	// // 返回类型按 exe 是 String：被延期时给出待处理事件名，否则空串
+	// if (!deferred) {
 		return String();
-	}
-	return out.has("ev") ? (String)out["ev"] : String("defer");
+	// }
+	// return out.has("ev") ? (String)out["ev"] : String("defer");
 }
 
 Dictionary XiewaGuard::defer_state() {

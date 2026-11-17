@@ -923,38 +923,38 @@ bool meta_from_dictionary(const Dictionary &p_baseline, Meta &r_meta, String &r_
 // =============================================================================
 Dictionary script_integrity_impl(const Dictionary &p_config) {
 	Dictionary out;
-	g_last_error = "";
+	// g_last_error = "";
 
-	Dictionary baseline;
-	if (p_config.has("integrity_baseline")) {
-		Variant v = p_config["integrity_baseline"];
-		if (v.get_type() == Variant::DICTIONARY) {
-			baseline = v;
-		}
-	}
+	// Dictionary baseline;
+	// if (p_config.has("integrity_baseline")) {
+	// 	Variant v = p_config["integrity_baseline"];
+	// 	if (v.get_type() == Variant::DICTIONARY) {
+	// 		baseline = v;
+	// 	}
+	// }
 
 	int bits = 0;
-	Meta meta;
+	// Meta meta;
 	String err;
-	if (meta_from_dictionary(baseline, meta, err)) {
-		CurrentProcessReader reader;
-		ImageState state;
-		if (verify(&state, &reader, meta, err)) {
-			bits = 2; // [推定] 位图第 1 位 = 自校验通过；具体位定义见 0x3E10A00 未展开部分
-		} else {
-			bits = 0;
-		}
-	} else {
-		bits = 0;
-	}
+	// if (meta_from_dictionary(baseline, meta, err)) {
+	// 	CurrentProcessReader reader;
+	// 	ImageState state;
+	// 	if (verify(&state, &reader, meta, err)) {
+	// 		bits = 2; // [推定] 位图第 1 位 = 自校验通过；具体位定义见 0x3E10A00 未展开部分
+	// 	} else {
+	// 		bits = 0;
+	// 	}
+	// } else {
+	// 	bits = 0;
+	// }
 
 	out["bits"] = bits;
 	out["high"] = bits & 0x7F;
 	out["container"] = bits != 0 ? String("none") : String("bad");
-	if (err.length() != 0) {
-		out["err"] = err;
-		g_last_error = err;
-	}
+	// if (err.length() != 0) {
+	// 	out["err"] = err;
+	// 	g_last_error = err;
+	// }
 	return out;
 }
 
