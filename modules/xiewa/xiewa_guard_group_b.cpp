@@ -158,10 +158,12 @@ PackedByteArray XiewaGuard::device_unwrap2(const PackedByteArray &in) {
 	for (int i = 0; i < mixed.size(); i++) {
 		p[i] = (uint8_t)(mixed[i] ^ ks[i % 32]);
 	}
-	// [修正 2026-11-16] 解出来必须能被 decode_variant 完整解码（等价于脚本侧 bytes_to_var 不炸）
-	if (!util::plain_is_decodable(out)) {
-		out = PackedByteArray();
-	}
+	// [修正 2026-11-17] 这里不再做"必须是 Dictionary"的校验：
+	//   device_wrap2 是通用封装，profile.cfg 的 wrapped_key 里封的就是
+	//   32 字节裸密钥（实测明文 32 B，不是 var_to_bytes(dict)）。
+	//   而 DPAPI 能解开本身就证明"这是本机本用户、由我方 dpapi_protect 写的数据"——
+	//   原程序的 blob 用不同熵，CryptUnprotectData 会直接失败返回空，
+	//   所以不存在"解开后是垃圾"的情况，无需再筛。
 #endif
 	return out;
 }

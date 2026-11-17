@@ -346,8 +346,9 @@ PackedByteArray XiewaGuard::device_unwrap(const PackedByteArray &in) {
 	for (int i = 0; i < in.size(); i++) {
 		w[i] = (uint8_t)(in[i] ^ ks[i % 32]);
 	}
-	// 解出来必须是 Variant 流，否则视为解不开
-	if (!util::plain_is_decodable(out)) {
+	// 解出来必须是 Variant 流；例外：32 字节裸密钥（profile.cfg 的 wrapped_key
+	// 封的就是 32 B 裸密钥，不是 var_to_bytes(dict)），不能误杀
+	if (!util::plain_is_decodable(out) && out.size() != 32) {
 		out = PackedByteArray();
 	}
 #else
