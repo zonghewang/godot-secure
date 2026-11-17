@@ -41,6 +41,20 @@ const uint8_t kEntropy2[32] = {
 	0x70, 0x94, 0x77, 0x0D, 0x4E, 0x87, 0xE3, 0x54,
 };
 
+// 原版 XiewaPai.exe-gf 的第二代真实熵（2026-11-17 离线复算 + 实测验证）：
+//   种子 = sha256(exe 文件 .text 段原始字节)            // 0x38F1230 sha256_final → 0xb0(%rsp)
+//   D    = K2(种子, "xw-bind")                          // 0x38F0EBE  KDF(0x20, tag 0x51F6618, → 0x558A7D0)
+//   熵   = K2(seed32(D), "xiewa-dpapi2")                // 0x38F1AF6  KDF(0x20, tag 0x51F66D3, → 0x50(%rsp))
+//   K2(d,t) = SHA256( ((d‖0^32) ⊕ saltB) ‖ SHA256( ((d‖0^32) ⊕ saltA) ‖ t ) )
+//   saltA = "6666666666666666"(0x51F64B0)  saltB = "\\\\\\\\\\\\\\\\(0x51F64C0)
+// 用它对 Diao 的 profile.cfg（原版 ombrel DPAPI 两块）解封成功，得到 32 B 存档密钥。
+const uint8_t kEntropyOrigGen2[32] = {
+	0x2C, 0x74, 0x0F, 0x13, 0x13, 0x81, 0xCB, 0xFB,
+	0xAF, 0xBE, 0x83, 0x06, 0xC6, 0xCA, 0x29, 0x35,
+	0x3D, 0x20, 0x9D, 0x97, 0x26, 0x9D, 0xEF, 0xF4,
+	0x3B, 0x08, 0xD6, 0x71, 0x65, 0x43, 0xB3, 0x25,
+};
+
 const char *kTagDpapi2 = "xiewa-dpapi2";
 const char *kTagDerive = "xw2-derive";
 const char *kTagOmbrel = "ombrel";
@@ -103,6 +117,27 @@ bool dpapi_unprotect(const Vector<uint8_t> &p_in, Vector<uint8_t> &r_out) {
 	LocalFree(out_blob.pbData);
 	return true;
 }
+
+// 指定熵的 DPAPI 解封（原版 CryptProtectData 带 pEntropy，desc 也是 "ombrel"）
+bool dpapi_unprotect_entropy(const Vector<uint8_t> &p_in, const uint8_t *p_entropy,
+		Vector<uint8_t> &r_out) {
+	DATA_BLOB in_blob;
+	in_blob.pbData = (BYTE *)p_in.ptr();
+	in_blob.cbData = (DWORD)p_in.size();
+	DATA_BLOB ent_blob;
+	ent_blob.pbData = (BYTE *)p_entropy;
+	ent_blob.cbData = 32;
+	DATA_BLOB out_blob;
+	memset(&out_blob, 0, sizeof(out_blob));
+	if (!CryptUnprotectData(&in_blob, nullptr, &ent_blob, nullptr, nullptr,
+				CRYPTPROTECT_UI_FORBIDDEN, &out_blob)) {
+		return false;
+	}
+	r_out.resize((int)out_blob.cbData);
+	memcpy(r_out.ptrw(), out_blob.pbData, out_blob.cbData);
+	LocalFree(out_blob.pbData);
+	return true;
+}
 #endif
 
 } // namespace
@@ -148,7 +183,18 @@ PackedByteArray XiewaGuard::device_unwrap2(const PackedByteArray &in) {
 	cipher.resize(in.size());
 	memcpy(cipher.ptrw(), in.ptr(), (size_t)in.size());
 	Vector<uint8_t> mixed;
+	bool legacy_orig = false;
 	if (!dpapi_unprotect(cipher, mixed)) {
+		// 我方格式解不开 → 试原版第二代（CryptProtectData + 静态熵，明文无 keystream）
+		if (!dpapi_unprotect_entropy(cipher, kEntropyOrigGen2, mixed)) {
+			return out;
+		}
+		legacy_orig = true;
+	}
+	if (legacy_orig) {
+		// 原版封的就是最终数据（profile.cfg 里是 32 B 裸密钥），不经过 keystream2
+		out.resize((int)mixed.size());
+		memcpy(out.ptrw(), mixed.ptr(), (size_t)mixed.size());
 		return out;
 	}
 	uint8_t ks[32];

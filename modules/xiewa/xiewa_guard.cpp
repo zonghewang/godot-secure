@@ -312,6 +312,46 @@ String XiewaGuard::audio_output_identity() {
 }
 
 // =============================================================================
+//  原版 DPAPI 静态熵（v1 第一代 / v2 第二代），用于解原程序写下的旧数据
+//  v1 熵：0x340D7E0 现场生成（T1@0x50A3100 / T2@0x50A3120 摊平），实算常量如下
+//  v2 熵：由 sha256(exe .text) 经两段式 KDF 派生，实算常量如下（已解 Diao 老档验证）
+// =============================================================================
+#ifdef WINDOWS_ENABLED
+static const uint8_t kEntropyGen1[32] = {
+	0x14, 0xAC, 0xF1, 0x4B, 0x1A, 0x59, 0xA4, 0x1E,
+	0x09, 0x16, 0xD6, 0xBD, 0x3D, 0x25, 0xF1, 0xF6,
+	0x64, 0xB2, 0x1E, 0xA8, 0x77, 0x15, 0xCF, 0x6F,
+	0x28, 0xB6, 0xA1, 0x80, 0x4E, 0xE2, 0x4C, 0x0F,
+};
+static const uint8_t kEntropyGen2[32] = {
+	0x2C, 0x74, 0x0F, 0x13, 0x13, 0x81, 0xCB, 0xFB,
+	0xAF, 0xBE, 0x83, 0x06, 0xC6, 0xCA, 0x29, 0x35,
+	0x3D, 0x20, 0x9D, 0x97, 0x26, 0x9D, 0xEF, 0xF4,
+	0x3B, 0x08, 0xD6, 0x71, 0x65, 0x43, 0xB3, 0x25,
+};
+
+static bool dpapi_unprotect_with_entropy(const PackedByteArray &p_in, const uint8_t *p_entropy,
+		Vector<uint8_t> &r_out) {
+	DATA_BLOB in_blob;
+	in_blob.pbData = (BYTE *)p_in.ptr();
+	in_blob.cbData = (DWORD)p_in.size();
+	DATA_BLOB ent_blob;
+	ent_blob.pbData = (BYTE *)p_entropy;
+	ent_blob.cbData = 32;
+	DATA_BLOB out_blob;
+	memset(&out_blob, 0, sizeof(out_blob));
+	if (!CryptUnprotectData(&in_blob, nullptr, &ent_blob, nullptr, nullptr,
+				CRYPTPROTECT_UI_FORBIDDEN, &out_blob)) {
+		return false;
+	}
+	r_out.resize((int)out_blob.cbData);
+	memcpy(r_out.ptrw(), out_blob.pbData, out_blob.cbData);
+	LocalFree(out_blob.pbData);
+	return true;
+}
+#endif
+
+// =============================================================================
 //  设备封装 / 解封（0x340D7E0 / 0x340DA40 / 0x340DCB0 / 0x340DED0）
 //  [修正 2026-11-16] 载体改为 PackedByteArray（exe 类型表四条都是 [PBA, PBA]）
 // =============================================================================
@@ -335,8 +375,16 @@ PackedByteArray XiewaGuard::device_unwrap(const PackedByteArray &in) {
 	PackedByteArray out;
 #ifdef WINDOWS_ENABLED
 	// [修正 2026-11-16] 原程序 v1 密文是 DPAPI blob（熵来自运行期表），我方解不开；
-	// 直接返回空，让脚本走 "dpapi"/"missing" 分支，而不是吐垃圾字节。
+	// [修正 2026-11-17] 两代熵都已离线复算出来，这里按顺序试解：
+	//   v1 熵 kEntropyGen1 → v2 熵 kEntropyGen2（desc 都是 "ombrel"）
+	//   任一试通即返回明文（原版封的就是最终数据，不做 keystream1 异或）
 	if (util::looks_like_dpapi(in)) {
+		Vector<uint8_t> plain;
+		if (dpapi_unprotect_with_entropy(in, kEntropyGen1, plain) ||
+				dpapi_unprotect_with_entropy(in, kEntropyGen2, plain)) {
+			out.resize((int)plain.size());
+			memcpy(out.ptrw(), plain.ptr(), (size_t)plain.size());
+		}
 		return out;
 	}
 	uint8_t ks[32];
