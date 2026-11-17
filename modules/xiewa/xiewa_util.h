@@ -360,12 +360,22 @@ inline String narrow(const wchar_t *p_w, int p_len = -1) {
 // 原程序取的是 "系统目录" 参与摘要；Godot 的 OS::get_system_dir() 需要 SystemDir 枚举，
 // 且没有"系统目录"这一项，这里直接走 Win32，语义更贴近原实现。
 inline String system_dir() {
-	wchar_t buf[32768];
-	UINT n = GetSystemDirectoryW(buf, 32767);
-	if (n == 0 || n >= 32767) {
+	// [修正 2026-11-17] 原实现 `wchar_t buf[32768]` 在栈上占 64 KB 单帧。
+	// 该函数被 machine_guid / system_volume_serial / device_tag 链调用，而这些调用
+	// 会从 GDScript 线程（godot Thread，栈余量远小于主线程）深处进入；
+	// 64 KB 单帧叠加引擎栈后会撞到 guard page，触发 CRT 的 __chkstk 失败路径
+	// （BEX64 c0000409 / fastfail 2）。改为堆缓冲，语义完全不变。
+	static const int kMax = 32767;
+	Vector<wchar_t> buf;
+	buf.resize(kMax + 1);
+	if (buf.is_empty()) {
 		return String();
 	}
-	return narrow(buf, (int)n);
+	UINT n = GetSystemDirectoryW(buf.ptrw(), (UINT)kMax);
+	if (n == 0 || n >= (UINT)kMax) {
+		return String();
+	}
+	return narrow(buf.ptr(), (int)n);
 }
 
 // -----------------------------------------------------------------------------
@@ -378,16 +388,29 @@ inline bool reg_read_string(HKEY p_root, const String &p_path, const String &p_n
 		return false;
 	}
 	std::wstring name = wide(p_name);
-	wchar_t buf[1024];
-	DWORD cb = sizeof(buf) - sizeof(wchar_t);
+	// [修正 2026-11-17] 原实现是栈上 wchar_t buf[1024] + `buf[cb/sizeof(wchar_t)] = 0`，
+	// 一旦 API 在成功路径上把 cb 写到 sizeof(buf) 边界，末尾写 0 就越界 2 字节；
+	// 同时 2 KB 栈帧在 GDScript 线程深处也有风险。改堆缓冲 + 显式上限校验。
+	static const DWORD kCharCap = 1024;
+	Vector<wchar_t> buf;
+	buf.resize((int)kCharCap);
+	if (buf.is_empty()) {
+		RegCloseKey(hk);
+		return false;
+	}
+	DWORD cb = (DWORD)(kCharCap * sizeof(wchar_t) - sizeof(wchar_t));
 	DWORD type = 0;
-	LONG rc = RegQueryValueExW(hk, name.empty() ? nullptr : name.c_str(), nullptr, &type, (LPBYTE)buf, &cb);
+	LONG rc = RegQueryValueExW(hk, name.empty() ? nullptr : name.c_str(), nullptr, &type, (LPBYTE)buf.ptrw(), &cb);
 	RegCloseKey(hk);
 	if (rc != ERROR_SUCCESS || (type != REG_SZ && type != REG_EXPAND_SZ)) {
 		return false;
 	}
-	buf[cb / sizeof(wchar_t)] = 0;
-	r_out = narrow(buf);
+	if (cb > kCharCap * sizeof(wchar_t)) {
+		return false;
+	}
+	const DWORD chars = cb / sizeof(wchar_t);
+	buf.ptrw()[chars] = 0;
+	r_out = narrow(buf.ptr(), (int)chars);
 	return true;
 }
 

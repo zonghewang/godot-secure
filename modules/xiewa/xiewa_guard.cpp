@@ -18,6 +18,8 @@
 #include "core/variant/array.h"
 #include "core/variant/dictionary.h"
 
+#include <mutex>
+
 #ifdef WINDOWS_ENABLED
 #include <windows.h>
 #endif
@@ -44,11 +46,50 @@ struct RuntimeState {
 	uint8_t startup_digest[32] = { 0 };
 	int consecutive_mismatches = 0;
 	bool confirmed_mismatch = false;
+
+	// d4（镜像完整性）的资格声明。pck 内
+	// res://resources/安全/runtime_detection.json 实测写的是
+	// "NOT_RUN_RECORD_ONLY"，且 数值守卫.gd 把
+	// const D4_ENFORCEMENT_QUALIFIED := False 硬编码 —— 原版 d4 只记录、不执行。
+	String d4_qualification = "NOT_RUN_RECORD_ONLY";
 };
 
 RuntimeState g_rt;
 HANDLE g_instance_mutex = nullptr;
 Dictionary g_last_scan;
+
+// [修正 2026-11-17] g_rt 会被两条线程触碰：
+//   ① 主线程 _initialize → configure_runtime_detection()
+//   ② 工具检测.gd::_scan 起的 Thread → scan_runtime_detection()
+// 之前 scan 里还每次都调 configure_runtime_detection(opts)，等于在扫描线程里
+// 反复改写同一个 RuntimeState（含 Dictionary baseline）并与主线程并发，
+// 属于典型的数据竞态 —— 破坏 Variant/Dictionary 的引用计数与栈上对象，
+// 正好对应 fastfail 2（栈 cookie 校验失败）。这里统一加锁，并保证
+// scan 只读配置、不再重灌。
+std::mutex &rt_lock() {
+	static std::mutex m;
+	return m;
+}
+
+// 进程启动标识：脚本侧契约要求 target_start 是「纯十进制、>0、长度 ≤ 20」，
+// 且同一进程内必须恒定（用于判定目标进程是否被换掉）。
+// 取内核记录的进程创建时间 FILETIME（100ns 精度，约 1.3e17，18 位）。
+#ifdef WINDOWS_ENABLED
+String process_start_token() {
+	FILETIME ct, et, kt, ut;
+	if (GetProcessTimes(GetCurrentProcess(), &ct, &et, &kt, &ut)) {
+		const uint64_t v = ((uint64_t)ct.dwHighDateTime << 32) | (uint64_t)ct.dwLowDateTime;
+		if (v > 0 && v < 10000000000000000000ull) {
+			return String::num_uint64(v);
+		}
+	}
+	return String("1");
+}
+#else
+String process_start_token() {
+	return String("1");
+}
+#endif
 
 inline int clamp_key(const Dictionary &p_cfg, const char *p_key, int p_lo, int p_hi, int p_default) {
 	if (!p_cfg.has(p_key)) {
@@ -158,6 +199,7 @@ bool XiewaGuard::configure_runtime_detection(const Dictionary &cfg) {
 	if (cfg.is_empty()) {
 		return false;
 	}
+	std::lock_guard<std::mutex> lock(rt_lock());
 	const Dictionary &d = cfg;
 
 	if (d.has("schema")) {
@@ -190,6 +232,13 @@ bool XiewaGuard::configure_runtime_detection(const Dictionary &cfg) {
 			g_rt.known_modules = m;
 		}
 	}
+	// d4 资格：只有 ENFORCEMENT_QUALIFIED 才允许真跑镜像哈希
+	if (d.has("d4_qualification")) {
+		String q = d["d4_qualification"];
+		if (!q.is_empty()) {
+			g_rt.d4_qualification = q;
+		}
+	}
 
 	g_rt.configured = true;
 	g_rt.have_startup = false;
@@ -199,36 +248,92 @@ bool XiewaGuard::configure_runtime_detection(const Dictionary &cfg) {
 }
 
 // 0x38ECA00：用已配置的基线跑一次自校验，产出报告字典
+//
+// [修正 2026-11-17] 返回值必须严格满足脚本侧契约
+//   res://globals/native_scan_contract.gd::validate()：
+//     schema:int==1 / target_pid:int / target_start:String(纯数字、>0、≤20 位) /
+//     hits:Array≤128（每项 tool/evidence String、confirmed/attached bool）/
+//     diagnostics:Array≤256 / integrity:Dictionary（state 属枚举） / complete:bool
+//   旧实现返回 {status, confirmed_mismatch, changed_since_startup,
+//   consecutive_mismatches, err}，且把 integrity 直接塞成 bool，
+//   validate() 第一条 schema 就不满足，于是兜底成
+//     {"diagnostics":["native_invalid_result"]}
+//   —— 这就是日志里 ["native_invalid_result"] 的唯一产生点。
+//   同时不再在 scan 里调 configure_runtime_detection：那是配置通道，
+//   在扫描线程里每次重灌会把 have_startup / consecutive_mismatches 清零，
+//   并与主线程并发改写同一个 RuntimeState。
 Dictionary XiewaGuard::scan_runtime_detection(const Dictionary &opts) {
-	if (!opts.is_empty()) {
-		// 原程序允许"配置 + 扫描"一次调用：先把配置灌进去
-		configure_runtime_detection(opts);
-	}
 	Dictionary out;
-	out["status"] = String("unavailable");
-	out["confirmed_mismatch"] = false;
-	out["changed_since_startup"] = false;
-	out["consecutive_mismatches"] = g_rt.consecutive_mismatches;
+	out["schema"] = 1;
+	out["target_pid"] = (int)OS::get_singleton()->get_process_id();
+	out["target_start"] = process_start_token();
+	out["complete"] = true;
+	out["hits"] = Array();
 
-	if (!g_rt.configured || g_rt.baseline.is_empty()) {
-		out["err"] = String("_baseline_invalid");
-		g_last_scan = out;
+	Array diag;
+	Dictionary integrity;
+	integrity["state"] = String("not_requested");
+
+	bool want_d4 = false;
+	if (opts.has("d4")) {
+		Variant v = opts["d4"];
+		want_d4 = (v.get_type() == Variant::BOOL) ? (bool)v : bool((int64_t)v);
+	}
+
+	// 未要求 d4（镜像/模块校验）时，按契约给出 not_requested 的空报告。
+	if (!want_d4) {
+		out["diagnostics"] = diag;
+		out["integrity"] = integrity;
 		return out;
+	}
+
+	// [修正 2026-11-17] 按原版资格声明决定 d4 是否真的跑镜像哈希。
+	// pck 里 runtime_detection.json 写的是 "NOT_RUN_RECORD_ONLY"，
+	// 脚本侧 const D4_ENFORCEMENT_QUALIFIED := False —— 原版只记录、不执行。
+	// 旧实现无条件在 Thread（实测栈仅 228 KB）里跑 68 MB .text 分块哈希，
+	// 既与原始行为不符，也会把后台线程拉进一条很长的调用链。
+	bool d4_enforce = false;
+	{
+		std::lock_guard<std::mutex> lock(rt_lock());
+		d4_enforce = (g_rt.d4_qualification == String("ENFORCEMENT_QUALIFIED"));
+	}
+	if (!d4_enforce) {
+		integrity["state"] = String("not_requested");
+		diag.push_back(String("D4:NOT_RUN_RECORD_ONLY"));
+		out["diagnostics"] = diag;
+		out["integrity"] = integrity;
+		return out;
+	}
+
+	Dictionary baseline;
+	{
+		std::lock_guard<std::mutex> lock(rt_lock());
+		if (!g_rt.configured || g_rt.baseline.is_empty()) {
+			integrity["state"] = String("unavailable");
+			diag.push_back(String("_baseline_invalid"));
+			out["diagnostics"] = diag;
+			out["integrity"] = integrity;
+			return out;
+		}
+		// 深拷贝：后面在扫描线程里读，主线程可能同时改配置
+		baseline = g_rt.baseline.duplicate(true);
 	}
 
 	xiewa_guard2d::Meta meta;
 	String err;
-	if (!xiewa_guard2d::impl::meta_from_dictionary(g_rt.baseline, meta, err)) {
-		out["err"] = err;
-		g_last_scan = out;
+	if (!xiewa_guard2d::impl::meta_from_dictionary(baseline, meta, err)) {
+		integrity["state"] = String("unavailable");
+		diag.push_back(err.is_empty() ? String("_meta_invalid") : err.left(2048));
+		out["diagnostics"] = diag;
+		out["integrity"] = integrity;
 		return out;
 	}
 
 	xiewa_guard2d::CurrentProcessReader reader;
 	xiewa_guard2d::ImageState state;
-	uint64_t t0 = OS::get_singleton()->get_ticks_usec();
-	bool ok = xiewa_guard2d::impl::verify(&state, &reader, meta, err);
-	uint64_t spent_us = OS::get_singleton()->get_ticks_usec() - t0;
+	const uint64_t t0 = OS::get_singleton()->get_ticks_usec();
+	const bool ok = xiewa_guard2d::impl::verify(&state, &reader, meta, err);
+	const uint64_t spent_us = OS::get_singleton()->get_ticks_usec() - t0;
 
 	bool have_digest = false;
 	for (int i = 0; i < 32; i++) {
@@ -237,41 +342,64 @@ Dictionary XiewaGuard::scan_runtime_detection(const Dictionary &opts) {
 			break;
 		}
 	}
-	String observed = have_digest ? util::to_hex32(state.digest) : String();
 
-	out["observed_sha256"] = observed;
-	out["bytes_hashed"] = (int64_t)state.info.text_size;
-	out["last_us"] = (int64_t)spent_us;
-	out["integrity"] = ok;
-
-	if (!g_rt.have_startup && ok) {
-		memcpy(g_rt.startup_digest, state.digest, 32);
-		g_rt.have_startup = true;
+	int consec = 0;
+	bool confirmed = false;
+	bool changed = false;
+	{
+		std::lock_guard<std::mutex> lock(rt_lock());
+		if (!g_rt.have_startup && ok) {
+			memcpy(g_rt.startup_digest, state.digest, 32);
+			g_rt.have_startup = true;
+		}
+		changed = g_rt.have_startup && have_digest &&
+				!util::ct_equal(g_rt.startup_digest, state.digest, 32);
+		if (ok) {
+			g_rt.consecutive_mismatches = 0;
+			g_rt.confirmed_mismatch = false;
+		} else {
+			g_rt.consecutive_mismatches++;
+			// [推定] 连续 3 次不一致才升级（阈值在 0x38ECA00 尾部按连续计数判定）
+			if (g_rt.consecutive_mismatches >= 3) {
+				g_rt.confirmed_mismatch = true;
+			}
+		}
+		consec = g_rt.consecutive_mismatches;
+		confirmed = g_rt.confirmed_mismatch;
 	}
-	out["startup_sha256"] = g_rt.have_startup ? util::to_hex32(g_rt.startup_digest) : String();
 
 	if (ok) {
-		g_rt.consecutive_mismatches = 0;
-		g_rt.confirmed_mismatch = false;
-		out["status"] = String("match");
+		integrity["state"] = String("match");
 	} else {
-		g_rt.consecutive_mismatches++;
-		// [推定] 连续 3 次不一致才升级（阈值在 0x38ECA00 尾部按连续计数判定）
-		if (g_rt.consecutive_mismatches >= 3) {
-			g_rt.confirmed_mismatch = true;
-		}
-		out["status"] = have_digest ? String("mismatch") : String("unavailable");
-		out["err"] = err;
+		integrity["state"] = have_digest ? String("mismatch") : String("unavailable");
+	}
+	// 契约：confirmed_mismatch 为 true 时 state 必须就是 confirmed_mismatch，
+	// 且 consecutive_mismatches ≥ 2（我们阈值是 3，天然满足）。
+	if (confirmed && consec >= 2) {
+		integrity["state"] = String("confirmed_mismatch");
+		integrity["confirmed_mismatch"] = true;
+	}
+	integrity["changed_since_startup"] = changed;
+	integrity["consecutive_mismatches"] = consec;
+
+	if (!err.is_empty()) {
+		diag.push_back(err.left(2048));
 	}
 
-	bool changed = g_rt.have_startup && have_digest &&
-			!util::ct_equal(g_rt.startup_digest, state.digest, 32);
-	out["changed_since_startup"] = changed;
-	out["consecutive_mismatches"] = g_rt.consecutive_mismatches;
-	out["confirmed_mismatch"] = g_rt.confirmed_mismatch;
-	out["scan_budget_ms"] = g_rt.scan_budget_ms;
+	out["diagnostics"] = diag;
+	out["integrity"] = integrity;
 
-	g_last_scan = out;
+	// 排障用的详细报告（脚本不消费，仅保留给 native 侧诊断）
+	Dictionary last;
+	last["observed_sha256"] = have_digest ? util::to_hex32(state.digest) : String();
+	last["bytes_hashed"] = (int64_t)state.info.text_size;
+	last["last_us"] = (int64_t)spent_us;
+	last["integrity"] = ok;
+	last["state"] = integrity["state"];
+	{
+		std::lock_guard<std::mutex> lock(rt_lock());
+		g_last_scan = last;
+	}
 	return out;
 }
 
