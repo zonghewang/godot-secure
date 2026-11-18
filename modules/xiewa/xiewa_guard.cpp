@@ -473,7 +473,34 @@ static bool dpapi_unprotect_with_entropy(const PackedByteArray &p_in, const uint
 		return false;
 	}
 	r_out.resize((int)out_blob.cbData);
-	memcpy(r_out.ptrw(), out_blob.pbData, out_blob.cbData);
+	memcpy(r_out.ptrw(), out_blob.pbData, (size_t)out_blob.cbData);
+	LocalFree(out_blob.pbData);
+	return true;
+}
+
+// [修正 2026-11-18] 带静态熵的 DPAPI 封装：原版 v1 段（0x340D7E0 的 user 段）就是
+//   直接 CryptProtectData(明文, desc="ombrel", entropy=kEntropyGen2)——
+//   现场样本 aa329b93408291a9 / b299a8b3cb53c02b 的 user 段用 kEntropyGen2 可解，
+//   解得 1676 B / 32 B 明文，首 u32 分别是 27（DICT）与裸密钥。
+static bool dpapi_protect_with_entropy(const Vector<uint8_t> &p_in, const uint8_t *p_entropy,
+		Vector<uint8_t> &r_out) {
+	if (p_in.size() == 0) {
+		return false;
+	}
+	DATA_BLOB in_blob;
+	in_blob.pbData = (BYTE *)p_in.ptr();
+	in_blob.cbData = (DWORD)p_in.size();
+	DATA_BLOB ent_blob;
+	ent_blob.pbData = (BYTE *)p_entropy;
+	ent_blob.cbData = 32;
+	DATA_BLOB out_blob;
+	memset(&out_blob, 0, sizeof(out_blob));
+	if (!CryptProtectData(&in_blob, L"ombrel", &ent_blob, nullptr, nullptr,
+				CRYPTPROTECT_UI_FORBIDDEN, &out_blob)) {
+		return false;
+	}
+	r_out.resize((int)out_blob.cbData);
+	memcpy(r_out.ptrw(), out_blob.pbData, (size_t)out_blob.cbData);
 	LocalFree(out_blob.pbData);
 	return true;
 }
@@ -486,13 +513,43 @@ static bool dpapi_unprotect_with_entropy(const PackedByteArray &p_in, const uint
 PackedByteArray XiewaGuard::device_wrap(const PackedByteArray &in) {
 	PackedByteArray out;
 #ifdef WINDOWS_ENABLED
-	uint8_t ks[32];
-	keystream1(device_tag(String()), ks);
-	out.resize(in.size());
-	uint8_t *w = out.ptrw();
-	for (int i = 0; i < in.size(); i++) {
-		w[i] = (uint8_t)(in[i] ^ ks[i % 32]);
+	// [修正 2026-11-18] 原版 0x340D7E0 的产物是 XWD3 双层容器，不是裸异或：
+	//   [0..3]   = "XWD3"（u32 LE = 0x33445758）
+	//   [4..7]   = user 段长度（u32 LE）
+	//   [8..]    = user 段
+	//   其后      = machine 段
+	// 现场三处样本都符合该结构：
+	//   aa329b93408291a9 3861 B（user 1918 / machine 1935，machine 首字节 0x02）
+	//   b299a8b3cb53c02b  556 B（user  274 / machine  274）
+	//   xw2-c55708826656  597 B（user  286 / machine  303）
+	// user 段用 kEntropyGen2 直封明文即可被官方 device_unwrap2 的 legacy 分支直接返回，
+	// machine 段走官方同构的 device_wrap_m2（[0x02][16B 设备标签][密文]）。
+	Vector<uint8_t> plain;
+	plain.resize(in.size());
+	if (in.size() > 0) {
+		memcpy(plain.ptrw(), in.ptr(), (size_t)in.size());
 	}
+	Vector<uint8_t> user_cipher;
+	if (!dpapi_protect_with_entropy(plain, kEntropyGen2, user_cipher)) {
+		return out;
+	}
+	PackedByteArray user_seg;
+	user_seg.resize((int)user_cipher.size());
+	memcpy(user_seg.ptrw(), user_cipher.ptr(), (size_t)user_cipher.size());
+	PackedByteArray machine_seg = device_wrap_m2(in);
+	if (machine_seg.is_empty()) {
+		machine_seg = user_seg;
+	}
+	out.resize(8 + user_seg.size() + machine_seg.size());
+	uint8_t *w = out.ptrw();
+	w[0] = 'X';
+	w[1] = 'W';
+	w[2] = 'D';
+	w[3] = '3';
+	uint32_t user_len = (uint32_t)user_seg.size();
+	memcpy(w + 4, &user_len, 4);
+	memcpy(w + 8, user_seg.ptr(), (size_t)user_seg.size());
+	memcpy(w + 8 + user_seg.size(), machine_seg.ptr(), (size_t)machine_seg.size());
 #else
 	out = in;
 #endif
@@ -502,10 +559,41 @@ PackedByteArray XiewaGuard::device_wrap(const PackedByteArray &in) {
 PackedByteArray XiewaGuard::device_unwrap(const PackedByteArray &in) {
 	PackedByteArray out;
 #ifdef WINDOWS_ENABLED
-	// [修正 2026-11-16] 原程序 v1 密文是 DPAPI blob（熵来自运行期表），我方解不开；
-	// [修正 2026-11-17] 两代熵都已离线复算出来，这里按顺序试解：
-	//   v1 熵 kEntropyGen1 → v2 熵 kEntropyGen2（desc 都是 "ombrel"）
-	//   任一试通即返回明文（原版封的就是最终数据，不做 keystream1 异或）
+	// 1) XWD3 双层容器（原版 0x340D7E0 的输出格式，必须先剥容器再解 user 段）
+	uint32_t magic = 0;
+	if (in.size() >= 8) {
+		memcpy(&magic, in.ptr(), 4);
+	}
+	if (magic == 0x33445758u) {
+		uint32_t user_len = 0;
+		memcpy(&user_len, in.ptr() + 4, 4);
+		if ((int)user_len > 0 && 8 + (int)user_len <= in.size()) {
+			PackedByteArray user_seg;
+			user_seg.resize((int)user_len);
+			memcpy(user_seg.ptrw(), in.ptr() + 8, (size_t)user_len);
+			// 1a) legacy 直封（kEntropyGen2）→ 解得即明文，不再 keystream 异或
+			Vector<uint8_t> plain;
+			if (dpapi_unprotect_with_entropy(user_seg, kEntropyGen2, plain)) {
+				out.resize((int)plain.size());
+				memcpy(out.ptrw(), plain.ptr(), (size_t)plain.size());
+				return out;
+			}
+			// 1b) 官方第二代封装（keystream2 + DPAPI 无熵）
+			out = device_unwrap2(user_seg);
+			if (!out.is_empty()) {
+				return out;
+			}
+			int machine_len = in.size() - 8 - (int)user_len;
+			if (machine_len > 0) {
+				PackedByteArray machine_seg;
+				machine_seg.resize(machine_len);
+				memcpy(machine_seg.ptrw(), in.ptr() + 8 + user_len, (size_t)machine_len);
+				return device_unwrap_m2(machine_seg);
+			}
+		}
+		return out;
+	}
+	// 2) 裸 DPAPI blob：v1 熵 kEntropyGen1(pepper) → v2 熵 kEntropyGen2，任一试通即明文
 	if (util::looks_like_dpapi(in)) {
 		Vector<uint8_t> plain;
 		if (dpapi_unprotect_with_entropy(in, kEntropyGen1, plain) ||
@@ -515,6 +603,7 @@ PackedByteArray XiewaGuard::device_unwrap(const PackedByteArray &in) {
 		}
 		return out;
 	}
+	// 3) 历史兼容：早期自造 keystream1 裸异或写出过的值，只在读旧数据时兜底
 	uint8_t ks[32];
 	keystream1(device_tag(String()), ks);
 	out.resize(in.size());
