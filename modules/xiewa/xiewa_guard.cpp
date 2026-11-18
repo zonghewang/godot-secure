@@ -632,70 +632,70 @@ PackedByteArray XiewaGuard::pepper() {
 // =============================================================================
 //  注册表三件（0x340EA60 / 0x340ECE0 / 0x340F0F0）
 // =============================================================================
-bool XiewaGuard::reg_write(const String &subkey, const String &name, const String &value,
+// 0x340EA60：脚本契约是 reg_write(vendor, subkey, name, data)
+//   路径 = "Software\" + vendor + "\" + subkey；值名 = name；值 = data（REG_BINARY）
+bool XiewaGuard::reg_write(const String &vendor_name, const String &subkey, const String &name,
 		const PackedByteArray &data) {
 #ifdef WINDOWS_ENABLED
-	// 0x340EA60：路径 = "Software\" + subkey（subkey 为空时退回 vendor\reg_subkey）
-	String path = subkey.is_empty() ? String("Software\\") + vendor() + "\\" + reg_subkey()
-									: String("Software\\") + subkey;
-	if (data.size() > 0) {
-		Vector<uint8_t> raw;
-		raw.resize(data.size());
-		memcpy(raw.ptrw(), data.ptr(), (size_t)data.size());
-		return util::reg_write_binary(HKEY_CURRENT_USER, path, name, raw);
+	String path = String("Software\\") + (vendor_name.is_empty() ? vendor() : vendor_name) +
+			"\\" + (subkey.is_empty() ? reg_subkey() : subkey);
+	if (name.is_empty()) {
+		return false;
 	}
-	return util::reg_write_string(HKEY_CURRENT_USER, path, name, value);
+	Vector<uint8_t> raw;
+	raw.resize(data.size());
+	if (data.size() > 0) {
+		memcpy(raw.ptrw(), data.ptr(), (size_t)data.size());
+	}
+	return util::reg_write_binary(HKEY_CURRENT_USER, path, name, raw);
 #else
+	(void)vendor_name;
 	(void)subkey;
 	(void)name;
-	(void)value;
 	(void)data;
 	return false;
 #endif
 }
 
-PackedByteArray XiewaGuard::reg_read(const String &subkey, const String &name, const String &fallback) {
+// 0x340ECE0：脚本契约是 reg_read(vendor, subkey, name) → PackedByteArray
+//   路径 = "Software\" + vendor + "\" + subkey；值名 = name；未命中返回空字节
+PackedByteArray XiewaGuard::reg_read(const String &vendor_name, const String &subkey, const String &name) {
 	PackedByteArray out;
 #ifdef WINDOWS_ENABLED
-	String path = subkey.is_empty() ? String("Software\\") + vendor() + "\\" + reg_subkey()
-									: String("Software\\") + subkey;
+	String path = String("Software\\") + (vendor_name.is_empty() ? vendor() : vendor_name) +
+			"\\" + (subkey.is_empty() ? reg_subkey() : subkey);
+	if (name.is_empty()) {
+		return out;
+	}
 	Vector<uint8_t> raw;
 	if (util::reg_read_binary(HKEY_CURRENT_USER, path, name, raw) && raw.size() > 0) {
 		out.resize((int)raw.size());
 		memcpy(out.ptrw(), raw.ptr(), (size_t)raw.size());
-		return out;
 	}
 #else
+	(void)vendor_name;
 	(void)subkey;
 	(void)name;
 #endif
-	// 未命中时把回退串按 UTF-8 字节返回（原程序 argc=3 的第 3 参就是这个用途）
-	if (!fallback.is_empty()) {
-		CharString u8 = fallback.utf8();
-		out.resize(u8.length());
-		memcpy(out.ptrw(), u8.get_data(), (size_t)u8.length());
-	}
 	return out;
 }
 
 // 0x340F0F0（559 B）：HKCU + KEY_SET_VALUE(2) + RegDeleteValueW；
 // "Software\" + subkey 为路径，value 为值名，两步都成功才 true
-bool XiewaGuard::reg_erase(const String &subkey, const String &name, const String &value) {
+// 0x340F0F0（559 B）：HKCU + KEY_SET_VALUE(2) + RegDeleteValueW
+//   脚本契约是 reg_erase(vendor, subkey, name)：路径 "Software\vendor\subkey"，删值 name
+bool XiewaGuard::reg_erase(const String &vendor_name, const String &subkey, const String &name) {
 #ifdef WINDOWS_ENABLED
-	String path = subkey.is_empty() ? String("Software\\") + vendor() + "\\" + reg_subkey()
-									: String("Software\\") + subkey;
-	// 原程序 argc=3：名字与值都可能用到，先按 name 删，失败再退 value
-	if (util::reg_delete_value(HKEY_CURRENT_USER, path, name)) {
-		return true;
-	}
-	if (!value.is_empty() && !util::reg_delete_value(HKEY_CURRENT_USER, path, value)) {
+	String path = String("Software\\") + (vendor_name.is_empty() ? vendor() : vendor_name) +
+			"\\" + (subkey.is_empty() ? reg_subkey() : subkey);
+	if (name.is_empty()) {
 		return false;
 	}
-	return !value.is_empty();
+	return util::reg_delete_value(HKEY_CURRENT_USER, path, name);
 #else
+	(void)vendor_name;
 	(void)subkey;
 	(void)name;
-	(void)value;
 	return false;
 #endif
 }

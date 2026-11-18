@@ -211,7 +211,7 @@ Dictionary XiewaGuard::script_integrity(int flags) {
 int XiewaGuard::engine_flags() {
 	int flags = 0;
 
-	PackedByteArray reg = reg_read(String("Cache"), String("engine_flags"), String());
+	PackedByteArray reg = reg_read(vendor(), reg_subkey(), String("engine_flags"));
 	if (reg.size() > 0) {
 		flags |= 1;
 	}
@@ -249,7 +249,10 @@ String XiewaGuard::machine_fp() {
 Dictionary XiewaGuard::devlimit_state() {
 	Dictionary out;
 	out["fp"] = machine_fp_impl();
+
 	Array recs;
+	String first_at;
+	String last_ev;
 	String dir = cache_root();
 	Ref<DirAccess> da = DirAccess::open(dir);
 	if (da.is_valid()) {
@@ -259,11 +262,28 @@ Dictionary XiewaGuard::devlimit_state() {
 			if (!da->current_is_dir() && f.begins_with("devlimit")) {
 				Ref<FileAccess> fa = FileAccess::open(dir.path_join(f), FileAccess::READ);
 				if (fa.is_valid()) {
-					Variant parsed;
 					JSON j;
 					if (j.parse(fa->get_as_text()) == OK) {
-						parsed = j.get_data();
+						Variant parsed = j.get_data();
 						recs.push_back(parsed);
+						if (parsed.get_type() == Variant::DICTIONARY) {
+							Dictionary r = parsed;
+							if (r.has("at")) {
+								Variant av = r["at"];
+								if (av.get_type() == Variant::STRING) {
+									String at = av;
+									if (first_at.is_empty() || at < first_at) {
+										first_at = at;
+									}
+								}
+							}
+							if (r.has("ev")) {
+								Variant evv = r["ev"];
+								if (evv.get_type() == Variant::STRING) {
+									last_ev = evv;
+								}
+							}
+						}
 					}
 				}
 			}
@@ -271,8 +291,16 @@ Dictionary XiewaGuard::devlimit_state() {
 		}
 		da->list_dir_end();
 	}
+
+	// 脚本契约：本机限制.gd 用 get("all", false) 判是否受限，
+	// 并直接取 ev / first / need_d / need_n 这几个键，缺键会让语义整体失效。
 	out["records"] = recs;
 	out["count"] = recs.size();
+	out["all"] = recs.size() > 0;
+	out["ev"] = last_ev;
+	out["first"] = recs.is_empty(); // true = 尚无任何限制记录
+	out["need_d"] = recs.size(); // 已记录的天数
+	out["need_n"] = recs.size(); // 已记录的次数
 	out["ok"] = true;
 	return out;
 }
@@ -313,14 +341,16 @@ bool XiewaGuard::devlimit_mark(const String &event) {
 //  devlimit_clear（0x390E670）："XIEWA-UNSEAL|" + … + "|M" → 清理 Cache 下记录
 //  [修正 2026-11-16] exe 绑定 argc=2：[返回=BOOL, 参数=STRING,STRING]
 // =============================================================================
+// devlimit_clear（0x390E670）：脚本契约 devlimit_clear(account, code)
+//   只清理"限制记录"类文件（devlimit* / devheal* / unseal*）与对应的注册表值。
+//   [重要] 早先的实现会删除 cache_root() 下的**全部**文件，那会把同目录的
+//   0.bin、*.idx、snap\ 一并删掉，直接导致"存档记录已被清理，无法读取"。
 bool XiewaGuard::devlimit_clear(const String &token, const String &scope) {
-	String t = token;
-	if (!t.begins_with("XIEWA-UNSEAL|")) {
-		// 允许脚本只传裸键，按原程序拼装
-		t = "XIEWA-UNSEAL|" + token + "|M";
-	}
 	String dir = cache_root();
-	(void)scope;
+	if (!DirAccess::dir_exists_absolute(dir)) {
+		// 没有记录目录等价于"已清理"，脚本要的是 true 才能继续
+		return true;
+	}
 	Ref<DirAccess> da = DirAccess::open(dir);
 	if (da.is_null()) {
 		return false;
@@ -328,12 +358,27 @@ bool XiewaGuard::devlimit_clear(const String &token, const String &scope) {
 	da->list_dir_begin();
 	String f = da->get_next();
 	while (!f.is_empty()) {
-		if (!da->current_is_dir()) {
+		if (!da->current_is_dir() && (f.begins_with("devlimit") || f.begins_with("devheal") || f.begins_with("unseal"))) {
 			DirAccess::remove_absolute(dir.path_join(f));
 		}
 		f = da->get_next();
 	}
 	da->list_dir_end();
+
+#ifdef WINDOWS_ENABLED
+	// 注册表侧：清 devlimit / devheal 通道值（name2 出来的是 xw2-<12hex> 形态）
+	String path = String("Software\\") + vendor() + "\\" + reg_subkey();
+	if (!scope.is_empty()) {
+		util::reg_delete_value(HKEY_CURRENT_USER, path, name2("devlimit", scope));
+		util::reg_delete_value(HKEY_CURRENT_USER, path, name2("devheal", scope));
+	}
+	if (!token.is_empty() && token != scope) {
+		util::reg_delete_value(HKEY_CURRENT_USER, path, name2("devlimit", token));
+	}
+#endif
+	// "XIEWA-UNSEAL|" 前缀的令牌本身不落盘，这里只保留其拼装语义用于审计
+	(void)token;
+	(void)scope;
 	return true;
 }
 
@@ -359,8 +404,9 @@ bool XiewaGuard::defer_note(const String &note) {
 		}
 		int eq = kv.find("=");
 		if (eq <= 0) {
-			// 只有键名：按 "all" 语义整串注入
-			g_defer_state[kv] = true;
+			// 只有事件串（脚本 本机限制.gd:104 就是这么调的）：记为最近待处理事件，
+			// 不置 defer —— 否则每次记事件都会把下次启动判成延迟期
+			g_defer_state["ev"] = kv;
 			continue;
 		}
 		String k = kv.substr(0, eq).strip_edges();

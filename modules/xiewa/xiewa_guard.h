@@ -121,13 +121,13 @@ public:
     // [确认] "Software\" + 串a + "\" + 串b → RegCreateKeyExW(HKLM, samDesired=0x20006)
     //        → RegSetValueExW(REG_BINARY=3) → RegCloseKey → sete sil
     // [修正 2026-11-16] exe 类型表：argc=4，[返回=BOOL, 参数=STRING,STRING,STRING,PACKED_BYTE_ARRAY]
-    static bool reg_write(const String &subkey, const String &name, const String &value,
+    static bool reg_write(const String &vendor_name, const String &subkey, const String &name,
             const PackedByteArray &data);
 
     // 绑定 @0x340CE21，入口 0x340ECE0
     // [确认] 同路径拼装 → RegOpenKeyExW → RegQueryValueExW 两段 → String::assign
     // [修正 2026-11-16] exe 类型表：argc=3，[返回=PACKED_BYTE_ARRAY, 参数=STRING,STRING,STRING]
-    static PackedByteArray reg_read(const String &subkey, const String &name, const String &fallback);
+    static PackedByteArray reg_read(const String &vendor_name, const String &subkey, const String &name);
 
     // 绑定 @0x340CF41，实现 0x340F0F0（559 B）【地址已修正 + 真体已复核】
     // [确认] 拼 "Software\" + a + "\" + b（0x50A3004 / 0x50A300E），转宽字符(0x340F9F0)
@@ -135,7 +135,7 @@ public:
     //        → RegDeleteValueW(hk, b) → RegCloseKey(hk)；开键成功且删值成功才 true。
     // ⚠ 旧结论"名实不符 / 无删除 API / HKLM"是读错位址(0x340EF00)所得，全部作废。
     // [修正 2026-11-16] exe 类型表：argc=3，[返回=BOOL, 参数=STRING,STRING,STRING]
-    static bool reg_erase(const String &subkey, const String &name, const String &value);
+    static bool reg_erase(const String &vendor_name, const String &subkey, const String &name);
 
     // 绑定 @0x340D061，入口 0x340F320
     // [确认] CreateFileW(GENERIC_WRITE=0x40000000, share=7, OPEN_EXISTING=3,
