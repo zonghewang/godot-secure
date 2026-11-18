@@ -14,6 +14,7 @@
 #include "core/io/dir_access.h"
 #include "core/io/file_access.h"
 #include "core/os/os.h"
+#include "core/string/print_string.h"
 #include "core/variant/array.h"
 #include "core/variant/dictionary.h"
 
@@ -283,6 +284,9 @@ PackedByteArray XiewaGuard::device_unwrap2(const PackedByteArray &in) {
 	out.resize((int)plain.size());
 	memcpy(out.ptrw(), plain.ptr(), (size_t)plain.size());
 #endif
+#ifdef DEBUG_ENABLED
+	print_line(vformat("[xiewa] device_unwrap2 in=%d -> %d", in.size(), out.size()));
+#endif
 	return out;
 }
 
@@ -310,30 +314,56 @@ PackedByteArray XiewaGuard::device_wrap_m2(const PackedByteArray &in) {
 }
 
 PackedByteArray XiewaGuard::device_unwrap_m2(const PackedByteArray &in) {
-	if (in.size() >= 17 && in[0] == 2) {
-		PackedByteArray cipher;
-		cipher.resize(in.size() - 17);
-		for (int i = 0; i < cipher.size(); i++) {
-			cipher.set(i, in[17 + i]);
+	// machine 段在本项目里只承载密钥（32 B）。读路径按三条候选依次尝试：
+	//   A. [02][16B tag][DPAPI+ks]（官方/本模块写出的标准 machine 段）
+	//   B. A 的无熵 DPAPI 变体（2026-11-17 之前自编译版写的 machine 段）
+	//   C. 无前缀整段（早期写路径未加标记）
+	// 命中 32 B 立即成功；长度 != 32 的非空结果只作最后兜底，绝不优先返回——
+	// 否则脚本层 _ensure_save_key 会拿到非 32 的 key 并直接判 T4_KEY。
+	PackedByteArray best;
+	auto take = [&best](const PackedByteArray &cand) -> bool {
+		if (cand.size() == 32) {
+			best = cand;
+			return true;
 		}
-		PackedByteArray r = device_unwrap2(cipher);
+		if (!cand.is_empty() && best.is_empty()) {
+			best = cand;
+		}
+		return false;
+	};
+
+	if (in.size() >= 17 && in[0] == 2) {
+		PackedByteArray cipher = in.slice(17);
+		if (take(device_unwrap2(cipher))) {
+			return best;
+		}
 #ifdef WINDOWS_ENABLED
-		if (r.is_empty() && cipher.size() > 0) {
-			// 只读兼容：旧自编译版的 machine 段是 "[2][16B][无熵 DPAPI]"。官方读它同样会失败
-			// （它只是 user 段之外的冗余副本），这里解出来仅用于本地自检与迁移写回。
+		if (cipher.size() > 0) {
 			Vector<uint8_t> c;
 			c.resize(cipher.size());
 			memcpy(c.ptrw(), cipher.ptr(), (size_t)cipher.size());
 			Vector<uint8_t> p;
 			if (dpapi_unprotect(c, p)) {
-				r.resize((int)p.size());
-				memcpy(r.ptrw(), p.ptr(), (size_t)p.size());
+				PackedByteArray cand;
+				cand.resize((int)p.size());
+				if (p.size() > 0) {
+					memcpy(cand.ptrw(), p.ptr(), (size_t)p.size());
+				}
+				if (take(cand)) {
+					return best;
+				}
 			}
 		}
 #endif
-		return r;
 	}
-	return device_unwrap2(in);
+
+	if (take(device_unwrap2(in))) {
+		return best;
+	}
+#ifdef DEBUG_ENABLED
+	print_line(vformat("[xiewa] device_unwrap_m2 in=%d -> %d", in.size(), best.size()));
+#endif
+	return best;
 }
 
 // =============================================================================

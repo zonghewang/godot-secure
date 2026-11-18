@@ -32,7 +32,7 @@ void XiewaGuard::_bind_methods() {
 	// ---------------------------------------------------------------- 组A 21 条
 	// 批函数 0x340C600；名称簇 0x50A2E80–0x50A2EAF
 	ClassDB::bind_static_method("XiewaGuard", D_METHOD("configure_runtime_detection", "cfg"), &XiewaGuard::configure_runtime_detection); // 名 0x50A2E80  绑定 0x340C721  实现 0x38EA8E0
-	ClassDB::bind_static_method("XiewaGuard", D_METHOD("scan_runtime_detection"), &XiewaGuard::scan_runtime_detection);                 // 名 0x50A2E9C  绑定 0x340C841  实现 0x38ECA00
+	ClassDB::bind_static_method("XiewaGuard", D_METHOD("scan_runtime_detection", "opts"), &XiewaGuard::scan_runtime_detection);                 // 名 0x50A2E9C  绑定 0x340C841  实现 0x38ECA00
 	ClassDB::bind_static_method("XiewaGuard", D_METHOD("audio_output_identity"), &XiewaGuard::audio_output_identity);                   // 名 0x50A2EB3  绑定 0x340C888  实现 0x38F04F0
 	ClassDB::bind_static_method("XiewaGuard", D_METHOD("device_wrap", "in"), &XiewaGuard::device_wrap);                                 // 名 0x50A2EC9  绑定 0x340C8CF  实现 0x340D7E0
 	ClassDB::bind_static_method("XiewaGuard", D_METHOD("device_unwrap", "in"), &XiewaGuard::device_unwrap);                             // 名 0x50A2ED5  绑定 0x340C916  实现 0x340DA40
@@ -45,7 +45,7 @@ void XiewaGuard::_bind_methods() {
 	ClassDB::bind_static_method("XiewaGuard", D_METHOD("reg_erase", "vendor", "subkey", "name"), &XiewaGuard::reg_erase);                        // 绑定 0x340CF41  实现 0x340F0F0（HKCU + KEY_SET_VALUE + RegDeleteValueW）
 	ClassDB::bind_static_method("XiewaGuard", D_METHOD("flush_file", "path"), &XiewaGuard::flush_file);                                 // 绑定 0x340D061  实现 0x340F320
 	ClassDB::bind_static_method("XiewaGuard", D_METHOD("move_file_durable", "from", "to"), &XiewaGuard::move_file_durable);             // 绑定 0x340D0A8  实现 0x340F400
-	ClassDB::bind_static_method("XiewaGuard", D_METHOD("single_instance_acquire"), &XiewaGuard::single_instance_acquire);               // 绑定 0x340D0EF  实现 0x340F520
+	ClassDB::bind_static_method("XiewaGuard", D_METHOD("single_instance_acquire", "name"), &XiewaGuard::single_instance_acquire);               // 绑定 0x340D0EF  实现 0x340F520
 	ClassDB::bind_static_method("XiewaGuard", D_METHOD("is_release_template"), &XiewaGuard::is_release_template);                       // 绑定 0x340D211  实现 0x340F590（mov al,1;ret）
 	ClassDB::bind_static_method("XiewaGuard", D_METHOD("flavor"), &XiewaGuard::flavor);                                                 // 绑定 0x340D258  实现 0x340F5A0（"release"）
 	ClassDB::bind_static_method("XiewaGuard", D_METHOD("vendor"), &XiewaGuard::vendor);                                                 // 绑定 0x340D29F  实现 0x340F5E0（"Ombrel"）
@@ -59,12 +59,12 @@ void XiewaGuard::_bind_methods() {
 	ClassDB::bind_static_method("XiewaGuard", D_METHOD("device_unwrap2", "in"), &XiewaGuard::device_unwrap2);                           // 名 0x51F6586  绑定 0x38F2ADD  实现 0x38F1B40
 	ClassDB::bind_static_method("XiewaGuard", D_METHOD("device_wrap_m2", "in"), &XiewaGuard::device_wrap_m2);                           // 名 0x51F6595  绑定 0x38F2B24  实现 0x38F1C70
 	ClassDB::bind_static_method("XiewaGuard", D_METHOD("device_unwrap_m2", "in"), &XiewaGuard::device_unwrap_m2);                       // 名 0x51F65A4  绑定 0x38F2B6B  实现 0x38F2000
-	ClassDB::bind_static_method("XiewaGuard", D_METHOD("sign2", "in"), &XiewaGuard::sign2);                                             // 名 0x51F65B5  绑定 0x38F2BB2  实现 0x38F2050
-	ClassDB::bind_static_method("XiewaGuard", D_METHOD("derive2", "in"), &XiewaGuard::derive2);                                         // 名 0x51F65BB  绑定 0x38F2BF9  实现 0x38F2510
-	ClassDB::bind_static_method("XiewaGuard", D_METHOD("verify2", "in"), &XiewaGuard::verify2);                                         // 名 0x51F65C3  绑定 0x38F2C40  实现 0x38F2300
+	ClassDB::bind_static_method("XiewaGuard", D_METHOD("sign2", "label", "key", "body"), &XiewaGuard::sign2);                                             // 名 0x51F65B5  绑定 0x38F2BB2  实现 0x38F2050
+	ClassDB::bind_static_method("XiewaGuard", D_METHOD("derive2", "label", "seed", "rounds"), &XiewaGuard::derive2);                                         // 名 0x51F65BB  绑定 0x38F2BF9  实现 0x38F2510
+	ClassDB::bind_static_method("XiewaGuard", D_METHOD("verify2", "label", "key", "body", "mac"), &XiewaGuard::verify2);                                         // 名 0x51F65C3  绑定 0x38F2C40  实现 0x38F2300
 	ClassDB::bind_static_method("XiewaGuard", D_METHOD("sign_blocked"), &XiewaGuard::sign_blocked);                                     // 名 0x51F65CB  绑定 0x38F2C87  实现 0x38F2460
 	ClassDB::bind_static_method("XiewaGuard", D_METHOD("test_block", "in"), &XiewaGuard::test_block);                                   // 名 0x51F65D8  绑定 0x38F2CCE  实现 0x38F8790
-	ClassDB::bind_static_method("XiewaGuard", D_METHOD("editor_check", "in"), &XiewaGuard::editor_check);                               // 名 0x51F65E3  绑定 0x38F2D15  实现 0x38F2DB0
+	ClassDB::bind_static_method("XiewaGuard", D_METHOD("editor_check", "what", "opts"), &XiewaGuard::editor_check);                               // 名 0x51F65E3  绑定 0x38F2D15  实现 0x38F2DB0
 	ClassDB::bind_static_method("XiewaGuard", D_METHOD("editor_cleanup", "in"), &XiewaGuard::editor_cleanup);                           // 名 0x51F65F0  绑定 0x38F2D5C  实现 0x38F3250
 	ClassDB::bind_static_method("XiewaGuard", D_METHOD("name2", "in", "suffix"), &XiewaGuard::name2);                                             // 名 0x51F65FF  绑定 0x38F2DA3  实现 0x38F36F0
 
@@ -85,10 +85,10 @@ void XiewaGuard::_bind_methods() {
 	ClassDB::bind_static_method("XiewaGuard", D_METHOD("list_raw"), &XiewaGuard::list_raw);                                             // 绑定 0x3910BC1  实现 0x390C7E0
 	ClassDB::bind_static_method("XiewaGuard", D_METHOD("list_check_profile", "profile"), &XiewaGuard::list_check_profile);               // 绑定 0x3910CE1  实现 0x390C860
 	ClassDB::bind_static_method("XiewaGuard", D_METHOD("id_hash", "id"), &XiewaGuard::id_hash);                                         // 绑定 0x3910D28  实现 0x390CB50
-	ClassDB::bind_static_method("XiewaGuard", D_METHOD("list_check_hash", "hash"), &XiewaGuard::list_check_hash);                       // 绑定 0x3910E41  实现 0x390CA20
+	ClassDB::bind_static_method("XiewaGuard", D_METHOD("list_check_hash", "hash", "kind"), &XiewaGuard::list_check_hash);                       // 绑定 0x3910E41  实现 0x390CA20
 	ClassDB::bind_static_method("XiewaGuard", D_METHOD("svc_verify", "sig"), &XiewaGuard::svc_verify);                                  // 绑定 0x3910E77  实现 0x390CA20（同体）
-	ClassDB::bind_static_method("XiewaGuard", D_METHOD("ck_state"), &XiewaGuard::ck_state);                                             // 绑定 0x3910F25  实现 0x390CA20（同体）
-	ClassDB::bind_static_method("XiewaGuard", D_METHOD("unseal_receipt", "key"), &XiewaGuard::unseal_receipt);                          // 绑定 0x3911051  实现 0x390F1A0
-	ClassDB::bind_static_method("XiewaGuard", D_METHOD("receipt_ok", "receipt", "expect"), &XiewaGuard::receipt_ok);                     // 绑定 0x3911171  实现 0x390FFA0
+	ClassDB::bind_static_method("XiewaGuard", D_METHOD("ck_state", "key"), &XiewaGuard::ck_state);                                             // 绑定 0x3910F25  实现 0x390CA20（同体）
+	ClassDB::bind_static_method("XiewaGuard", D_METHOD("unseal_receipt", "key", "machine", "salt", "channel", "extra"), &XiewaGuard::unseal_receipt);                          // 绑定 0x3911051  实现 0x390F1A0
+	ClassDB::bind_static_method("XiewaGuard", D_METHOD("receipt_ok", "receipt", "expect", "seg", "salt", "channel"), &XiewaGuard::receipt_ok);                     // 绑定 0x3911171  实现 0x390FFA0
 	ClassDB::bind_static_method("XiewaGuard", D_METHOD("unseal_legacy_ok", "receipt"), &XiewaGuard::unseal_legacy_ok);                   // 绑定 0x39111B8  实现 0x3910070
 }
