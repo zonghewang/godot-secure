@@ -34,7 +34,7 @@ uint64_t g_first_tick = 0;
 
 // 第二套异或生成器的实算熵（四张真表 T10@0x51F6500 / T11@0x51F6520 /
 // TS@0x51F6540 / T14@0x558A7D0 摊平后的 32 字节）
-const uint8_t kEntropy2[32] = {
+[[maybe_unused]] const uint8_t kEntropy2[32] = {
 	0xDA, 0x1B, 0x03, 0x0D, 0x4B, 0x57, 0x8A, 0xE4,
 	0x66, 0x14, 0x83, 0x12, 0x83, 0x13, 0xB0, 0xE3,
 	0x03, 0x1C, 0x32, 0x70, 0xC1, 0x28, 0xEF, 0xE4,
@@ -74,19 +74,68 @@ bool gate() {
 	return false;
 }
 
-// 第二族 keystream：熵 ⊕ 机器标签摘要
-void keystream2(const String &p_tag, uint8_t r_out[32]) {
-	uint8_t tag[32];
-	CharString u8 = p_tag.utf8();
-	util::sha256(u8.get_data(), (size_t)u8.length(), tag);
+// -----------------------------------------------------------------------------
+//  第二代 DPAPI 熵（0x38F1970 第 3 步逐指令实证，2026-11-18 二次核对）
+//
+//    官方不用任何静态常量作熵，而是现场从四张 .rdata 表摊平出一个 32 B 矩阵：
+//      T1 @ 0x51F6500（32 B）  T2 @ 0x51F6520（32 B）
+//      T3 @ 0x51F6540（32 B）  T4 @ 0x558A7D0（32 B）
+//      i = 0 .. 31：
+//        v  = (T1[(9 + 11i) & 31] * 0x2D + (0x5A + 23i)) & 0xFF
+//        v ^= T2[(3 + 5i) & 31]
+//        v ^= T3[(0x0B + 7i) & 31]
+//        v ^= T4[i]
+//        mat[i] = v
+//      实算 mat = c97253c28ceb3568880aa9a872330f4dfcfb22cf990c630feced8038f939a4be
+//
+//    然后 0x38F12E0 是一条标准 HMAC：
+//      HMAC_SHA256(key = mat32, msg = "xiewa-dpapi2"(12 B)) → [rsp+0x20]
+//      实算 ks = 393d8cb8b2cd67b4a0baf23690aa628c82fa1768f2515355d14b8ee6837fb801
+//
+//    ks 只被当作 CryptProtectData / CryptUnprotectData 的 pOptionalEntropy，
+//   ** 不做任何明文异或 **（上一版把它当 XOR 流用，是彻底错的）。
+// -----------------------------------------------------------------------------
+const uint8_t kXw2T1[32] = {
+	0x94, 0x77, 0x50, 0x29, 0xAE, 0xFB, 0xF8, 0x7D,
+	0xA4, 0x63, 0x01, 0x59, 0x67, 0x23, 0xAA, 0xD1,
+	0x30, 0x6C, 0xE5, 0x24, 0xEA, 0xDD, 0x9C, 0xA3,
+	0xBF, 0x4B, 0x8D, 0x34, 0x77, 0xD5, 0x5B, 0x7A,
+};
+const uint8_t kXw2T2[32] = {
+	0xA1, 0xF8, 0x72, 0x3E, 0xE3, 0x40, 0xC4, 0x47,
+	0xD3, 0x59, 0xD2, 0xDC, 0xD2, 0x5C, 0xA2, 0x41,
+	0x0F, 0x74, 0x59, 0xED, 0xE6, 0xF9, 0xEA, 0xEC,
+	0xCB, 0x44, 0xBB, 0x76, 0xE5, 0xA8, 0xE7, 0x9E,
+};
+const uint8_t kXw2T3[32] = {
+	0x39, 0x16, 0x01, 0x07, 0x30, 0x9B, 0x49, 0x18,
+	0x76, 0x47, 0xFE, 0x05, 0xAC, 0x60, 0xC2, 0xD0,
+	0x7B, 0xD5, 0xFA, 0xF8, 0x75, 0xC3, 0x09, 0xB3,
+	0x6F, 0x8D, 0x10, 0x77, 0xE6, 0x5F, 0xF6, 0xD8,
+};
+const uint8_t kXw2T4[32] = {
+	0x33, 0xC8, 0x78, 0x6E, 0xF7, 0x1D, 0x87, 0x2D,
+	0xAE, 0xBF, 0x62, 0x1B, 0xA1, 0x81, 0xE7, 0x0F,
+	0x9F, 0x46, 0x78, 0x1E, 0x28, 0x85, 0xF4, 0x4A,
+	0x1C, 0xD8, 0x7F, 0x94, 0x27, 0x1F, 0xDF, 0x4B,
+};
+
+void xw2_entropy32(uint8_t r_out[32]) {
+	uint8_t mat[32];
 	for (int i = 0; i < 32; i++) {
-		r_out[i] = (uint8_t)(kEntropy2[i] ^ tag[i]);
+		uint8_t v = (uint8_t)(((uint32_t)kXw2T1[(9 + 11 * i) & 31] * 45u +
+				(uint32_t)(0x5A + 23 * i)) & 0xFF);
+		v ^= kXw2T2[(3 + 5 * i) & 31];
+		v ^= kXw2T3[(0x0B + 7 * i) & 31];
+		v ^= kXw2T4[i];
+		mat[i] = v;
 	}
+	util::hmac_sha256(mat, 32, "xiewa-dpapi2", 12, r_out);
 }
 
 #ifdef WINDOWS_ENABLED
 // DPAPI 保护（0x38F1730 分支）
-bool dpapi_protect(const Vector<uint8_t> &p_in, Vector<uint8_t> &r_out) {
+[[maybe_unused]] bool dpapi_protect(const Vector<uint8_t> &p_in, Vector<uint8_t> &r_out) {
 	DATA_BLOB in_blob;
 	in_blob.pbData = (BYTE *)p_in.ptr();
 	in_blob.cbData = (DWORD)p_in.size();
@@ -114,6 +163,34 @@ bool dpapi_unprotect(const Vector<uint8_t> &p_in, Vector<uint8_t> &r_out) {
 	}
 	r_out.resize((int)out_blob.cbData);
 	memcpy(r_out.ptrw(), out_blob.pbData, out_blob.cbData);
+	LocalFree(out_blob.pbData);
+	return true;
+}
+
+// 官方 0x38F1730 的 protect 分支（r9b != 0）：
+//   CryptProtectData(pDataIn, szDataDescr = L"ombrel",
+//                    pOptionalEntropy = 32 B, NULL, NULL, CRYPTPROTECT_UI_FORBIDDEN)
+// 0x38F1730 里 flags 的取法是 `movzx eax,[rsp+0xc0]; lea eax,[rax*4+1]`，
+//   wrap2 / unwrap2 / m2 三处调用都传 0 → flags 恒为 1；描述串与 device_wrap 同为 "ombrel"。
+bool dpapi_protect_entropy2(const Vector<uint8_t> &p_in, const uint8_t *p_entropy,
+		Vector<uint8_t> &r_out) {
+	if (p_in.size() == 0) {
+		return false;
+	}
+	DATA_BLOB in_blob;
+	in_blob.pbData = (BYTE *)p_in.ptr();
+	in_blob.cbData = (DWORD)p_in.size();
+	DATA_BLOB ent_blob;
+	ent_blob.pbData = (BYTE *)p_entropy;
+	ent_blob.cbData = 32;
+	DATA_BLOB out_blob;
+	memset(&out_blob, 0, sizeof(out_blob));
+	if (!CryptProtectData(&in_blob, L"ombrel", &ent_blob, nullptr, nullptr,
+				CRYPTPROTECT_UI_FORBIDDEN, &out_blob)) {
+		return false;
+	}
+	r_out.resize((int)out_blob.cbData);
+	memcpy(r_out.ptrw(), out_blob.pbData, (size_t)out_blob.cbData);
 	LocalFree(out_blob.pbData);
 	return true;
 }
@@ -152,16 +229,21 @@ PackedByteArray XiewaGuard::device_wrap2(const PackedByteArray &in) {
 		return out;
 	}
 #ifdef WINDOWS_ENABLED
-	Vector<uint8_t> mixed;
-	mixed.resize(in.size());
-	uint8_t *mw = mixed.ptrw();
-	uint8_t ks[32];
-	keystream2(device_tag(String()), ks);
-	for (int i = 0; i < in.size(); i++) {
-		mw[i] = (uint8_t)(in[i] ^ ks[i % 32]);
+	// 官方 0x38F1970 全流程（2026-11-18 二次逐指令核对）：
+	//   ① gate：call 0x38F7B60(bridge_check，参数 2) → and eax,0x63 → 非 0 返回空
+	//   ② 四表摊平得 mat32（见 xw2_entropy32 注释）
+	//   ③ HMAC_SHA256(mat32, "xiewa-dpapi2") → ks
+	//   ④ CryptProtectData(in, L"ombrel", entropy = ks, NULL, NULL, UI_FORBIDDEN)
+	// 全程没有任何明文异或，也没有自造的字节头。
+	Vector<uint8_t> plain;
+	plain.resize(in.size());
+	if (in.size() > 0) {
+		memcpy(plain.ptrw(), in.ptr(), (size_t)in.size());
 	}
+	uint8_t ks[32];
+	xw2_entropy32(ks);
 	Vector<uint8_t> cipher;
-	if (!dpapi_protect(mixed, cipher)) {
+	if (!dpapi_protect_entropy2(plain, ks, cipher)) {
 		return out;
 	}
 	out.resize((int)cipher.size());
@@ -176,40 +258,30 @@ PackedByteArray XiewaGuard::device_unwrap2(const PackedByteArray &in) {
 		return out;
 	}
 #ifdef WINDOWS_ENABLED
+	// 官方 0x38F1B40 与 wrap2 完全对称：同 gate、同四表 mat32、同 HMAC，
+	// 唯一差别是 `xor r9d,r9d` → mode = 0 → CryptUnprotectData。
+	// 读路径额外保留一条 kEntropyOrigGen2 兜底，只为把 2026-11-17 之前自编译版写下的
+	// 旧本地数据读出来；官方版本从不产那种格式，写路径也永不用它，因此不影响互通。
+	// 也**不做**任何 keystream 反异或：那只会让非官方格式的坏数据被当成好数据。
 	if (in.size() == 0) {
 		return out;
 	}
 	Vector<uint8_t> cipher;
 	cipher.resize(in.size());
 	memcpy(cipher.ptrw(), in.ptr(), (size_t)in.size());
-	Vector<uint8_t> mixed;
-	bool legacy_orig = false;
-	if (!dpapi_unprotect(cipher, mixed)) {
-		// 我方格式解不开 → 试原版第二代（CryptProtectData + 静态熵，明文无 keystream）
-		if (!dpapi_unprotect_entropy(cipher, kEntropyOrigGen2, mixed)) {
-			return out;
-		}
-		legacy_orig = true;
-	}
-	if (legacy_orig) {
-		// 原版封的就是最终数据（profile.cfg 里是 32 B 裸密钥），不经过 keystream2
-		out.resize((int)mixed.size());
-		memcpy(out.ptrw(), mixed.ptr(), (size_t)mixed.size());
+	uint8_t ks[32];
+	xw2_entropy32(ks);
+	Vector<uint8_t> plain;
+	if (!dpapi_unprotect_entropy(cipher, ks, plain) &&
+			!dpapi_unprotect_entropy(cipher, kEntropyOrigGen2, plain)) {
+		// 第二条只用于“把用户既有本地数据读出来”：2026-11-17 之前的自编译版
+		// 用 kEntropyOrigGen2 作静态熵 + 无熵 DPAPI 写过 XWD3 的 user 段。
+		// 官方从不产生这种格式，所以它只出现在读路径；写路径（device_wrap2）
+		// 永远只用 ks，不会污染互通性。
 		return out;
 	}
-	uint8_t ks[32];
-	keystream2(device_tag(String()), ks);
-	out.resize((int)mixed.size());
-	uint8_t *p = out.ptrw();
-	for (int i = 0; i < mixed.size(); i++) {
-		p[i] = (uint8_t)(mixed[i] ^ ks[i % 32]);
-	}
-	// [修正 2026-11-17] 这里不再做"必须是 Dictionary"的校验：
-	//   device_wrap2 是通用封装，profile.cfg 的 wrapped_key 里封的就是
-	//   32 字节裸密钥（实测明文 32 B，不是 var_to_bytes(dict)）。
-	//   而 DPAPI 能解开本身就证明"这是本机本用户、由我方 dpapi_protect 写的数据"——
-	//   原程序的 blob 用不同熵，CryptUnprotectData 会直接失败返回空，
-	//   所以不存在"解开后是垃圾"的情况，无需再筛。
+	out.resize((int)plain.size());
+	memcpy(out.ptrw(), plain.ptr(), (size_t)plain.size());
 #endif
 	return out;
 }
@@ -244,7 +316,22 @@ PackedByteArray XiewaGuard::device_unwrap_m2(const PackedByteArray &in) {
 		for (int i = 0; i < cipher.size(); i++) {
 			cipher.set(i, in[17 + i]);
 		}
-		return device_unwrap2(cipher);
+		PackedByteArray r = device_unwrap2(cipher);
+#ifdef WINDOWS_ENABLED
+		if (r.is_empty() && cipher.size() > 0) {
+			// 只读兼容：旧自编译版的 machine 段是 "[2][16B][无熵 DPAPI]"。官方读它同样会失败
+			// （它只是 user 段之外的冗余副本），这里解出来仅用于本地自检与迁移写回。
+			Vector<uint8_t> c;
+			c.resize(cipher.size());
+			memcpy(c.ptrw(), cipher.ptr(), (size_t)cipher.size());
+			Vector<uint8_t> p;
+			if (dpapi_unprotect(c, p)) {
+				r.resize((int)p.size());
+				memcpy(r.ptrw(), p.ptr(), (size_t)p.size());
+			}
+		}
+#endif
+		return r;
 	}
 	return device_unwrap2(in);
 }

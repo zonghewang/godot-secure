@@ -14,6 +14,7 @@
 
 #include "core/io/dir_access.h"
 #include "core/io/file_access.h"
+#include "core/math/math_funcs.h"
 #include "core/os/os.h"
 #include "core/variant/array.h"
 #include "core/variant/dictionary.h"
@@ -504,6 +505,83 @@ static bool dpapi_protect_with_entropy(const Vector<uint8_t> &p_in, const uint8_
 	LocalFree(out_blob.pbData);
 	return true;
 }
+
+// 读取官方设备种子（0x340E0F0 的输入侧实证）：
+//   官方 device_tag(path) 先 FileAccess 打开 path 读全部字节，再走 device_unwrap
+//   （= CryptUnprotectData + entropy = kEntropyGen1），解出内容长度必须恰好 32 字节，
+//   否则视为无效。path 由脚本传 device_store_path()，即
+//   %LOCALAPPDATA%\<vendor>\<cache_dir>\0.bin（现场 C:\Users\<u>\AppData\Local\Ombrel\cache\0.bin）。
+//   实测该文件 274 B，用 kEntropyGen1 解出 32 B：50b1a9a7…677dc39f，与官方实现对齐。
+static bool device_seed32(uint8_t r_out[32]) {
+	String base = OS::get_singleton()->get_environment("LOCALAPPDATA");
+	if (base.is_empty()) {
+		return false;
+	}
+	String path = base.replace("\\", "/") + "/Ombrel/cache/0.bin";
+	Ref<FileAccess> f = FileAccess::open(path, FileAccess::READ);
+	if (f.is_null()) {
+		return false;
+	}
+	PackedByteArray blob = f->get_buffer((int)f->get_length());
+	f.unref();
+	if (blob.size() == 0) {
+		return false;
+	}
+	Vector<uint8_t> plain;
+	if (!dpapi_unprotect_with_entropy(blob, kEntropyGen1, plain)) {
+		return false;
+	}
+	if (plain.size() != 32) {
+		return false;
+	}
+	memcpy(r_out, plain.ptr(), 32);
+	return true;
+}
+
+// 带 LOCAL_MACHINE 语义的 DPAPI（官方 device_wrap_m 的 dwFlags = 5：
+// CRYPTPROTECT_UI_FORBIDDEN | CRYPTPROTECT_LOCAL_MACHINE）
+static bool dpapi_protect_machine(const Vector<uint8_t> &p_in, const uint8_t *p_entropy,
+		Vector<uint8_t> &r_out) {
+	if (p_in.size() == 0) {
+		return false;
+	}
+	DATA_BLOB in_blob;
+	in_blob.pbData = (BYTE *)p_in.ptr();
+	in_blob.cbData = (DWORD)p_in.size();
+	DATA_BLOB ent_blob;
+	ent_blob.pbData = (BYTE *)p_entropy;
+	ent_blob.cbData = 32;
+	DATA_BLOB out_blob;
+	memset(&out_blob, 0, sizeof(out_blob));
+	if (!CryptProtectData(&in_blob, L"ombrel", &ent_blob, nullptr, nullptr,
+				CRYPTPROTECT_UI_FORBIDDEN | CRYPTPROTECT_LOCAL_MACHINE, &out_blob)) {
+		return false;
+	}
+	r_out.resize((int)out_blob.cbData);
+	memcpy(r_out.ptrw(), out_blob.pbData, (size_t)out_blob.cbData);
+	LocalFree(out_blob.pbData);
+	return true;
+}
+
+static bool dpapi_unprotect_machine(const Vector<uint8_t> &p_in, const uint8_t *p_entropy,
+		Vector<uint8_t> &r_out) {
+	DATA_BLOB in_blob;
+	in_blob.pbData = (BYTE *)p_in.ptr();
+	in_blob.cbData = (DWORD)p_in.size();
+	DATA_BLOB ent_blob;
+	ent_blob.pbData = (BYTE *)p_entropy;
+	ent_blob.cbData = 32;
+	DATA_BLOB out_blob;
+	memset(&out_blob, 0, sizeof(out_blob));
+	if (!CryptUnprotectData(&in_blob, nullptr, &ent_blob, nullptr, nullptr,
+				CRYPTPROTECT_UI_FORBIDDEN | CRYPTPROTECT_LOCAL_MACHINE, &out_blob)) {
+		return false;
+	}
+	r_out.resize((int)out_blob.cbData);
+	memcpy(r_out.ptrw(), out_blob.pbData, (size_t)out_blob.cbData);
+	LocalFree(out_blob.pbData);
+	return true;
+}
 #endif
 
 // =============================================================================
@@ -513,43 +591,36 @@ static bool dpapi_protect_with_entropy(const Vector<uint8_t> &p_in, const uint8_
 PackedByteArray XiewaGuard::device_wrap(const PackedByteArray &in) {
 	PackedByteArray out;
 #ifdef WINDOWS_ENABLED
-	// [修正 2026-11-18] 原版 0x340D7E0 的产物是 XWD3 双层容器，不是裸异或：
-	//   [0..3]   = "XWD3"（u32 LE = 0x33445758）
-	//   [4..7]   = user 段长度（u32 LE）
-	//   [8..]    = user 段
-	//   其后      = machine 段
-	// 现场三处样本都符合该结构：
-	//   aa329b93408291a9 3861 B（user 1918 / machine 1935，machine 首字节 0x02）
-	//   b299a8b3cb53c02b  556 B（user  274 / machine  274）
-	//   xw2-c55708826656  597 B（user  286 / machine  303）
-	// user 段用 kEntropyGen2 直封明文即可被官方 device_unwrap2 的 legacy 分支直接返回，
-	// machine 段走官方同构的 device_wrap_m2（[0x02][16B 设备标签][密文]）。
+	// [修正 2026-11-18 二次] 反汇编 0x340D7E0 逐指令实证：官方 device_wrap 就是一次
+	//   CryptProtectData(
+	//       pDataIn          = 输入整段 PackedByteArray,
+	//       szDataDescr      = L"ombrel"，
+	//       pOptionalEntropy = 32 B 常量（由 0x340D827/0x340D82E 指向的
+	//                          .rdata 两表 0x50A3100 / 0x50A3120 现场摊平生成），
+	//       pwszPrompt       = NULL, dwFlags = CRYPTPROTECT_UI_FORBIDDEN(1))
+	//
+	// 摊平公式（0x340D840..0x340D881，k = 0..15）：
+	//   rax = 1 + 2k ; r8 = 0x12 + 0x1A*k ; dl = 0x3B + 0x76*k
+	//   out[rax-1] = (B[((r8 - 0x0D) & 0x1F)] + dl + 0xC5) ^ A[rax-1]
+	//   out[rax]   = (B[(r8 & 0x1E)]            + dl)        ^ A[rax]
+	// 实算结果 = 14acf14b1a59a41e0916d6bd3d25f1f664b21ea87715cf6f28b6a1804ee24c0f，
+	// 与 kEntropyGen1 完全一致（已用 1 组 Python 复算对齐）。
+	//
+	// 结论：v1 段既不做设备标签 keystream，也不产 XWD3 容器。
+	//   XWD3 头由脚本层 守护.gd:device_wrap() 自己拼（8 字节头 + user 段 + machine 段），
+	//   native 只负责段内那一次 DPAPI。上一版把容器塞进本函数会造成双重封装，
+	//   官方版因此解不出我方写的值（现场 T4_MARKS_BROKEN 的直接成因）。
 	Vector<uint8_t> plain;
 	plain.resize(in.size());
 	if (in.size() > 0) {
 		memcpy(plain.ptrw(), in.ptr(), (size_t)in.size());
 	}
-	Vector<uint8_t> user_cipher;
-	if (!dpapi_protect_with_entropy(plain, kEntropyGen2, user_cipher)) {
+	Vector<uint8_t> cipher;
+	if (!dpapi_protect_with_entropy(plain, kEntropyGen1, cipher)) {
 		return out;
 	}
-	PackedByteArray user_seg;
-	user_seg.resize((int)user_cipher.size());
-	memcpy(user_seg.ptrw(), user_cipher.ptr(), (size_t)user_cipher.size());
-	PackedByteArray machine_seg = device_wrap_m2(in);
-	if (machine_seg.is_empty()) {
-		machine_seg = user_seg;
-	}
-	out.resize(8 + user_seg.size() + machine_seg.size());
-	uint8_t *w = out.ptrw();
-	w[0] = 'X';
-	w[1] = 'W';
-	w[2] = 'D';
-	w[3] = '3';
-	uint32_t user_len = (uint32_t)user_seg.size();
-	memcpy(w + 4, &user_len, 4);
-	memcpy(w + 8, user_seg.ptr(), (size_t)user_seg.size());
-	memcpy(w + 8 + user_seg.size(), machine_seg.ptr(), (size_t)machine_seg.size());
+	out.resize((int)cipher.size());
+	memcpy(out.ptrw(), cipher.ptr(), (size_t)cipher.size());
 #else
 	out = in;
 #endif
@@ -559,107 +630,97 @@ PackedByteArray XiewaGuard::device_wrap(const PackedByteArray &in) {
 PackedByteArray XiewaGuard::device_unwrap(const PackedByteArray &in) {
 	PackedByteArray out;
 #ifdef WINDOWS_ENABLED
-	// 1) XWD3 双层容器（原版 0x340D7E0 的输出格式，必须先剥容器再解 user 段）
-	uint32_t magic = 0;
-	if (in.size() >= 8) {
-		memcpy(&magic, in.ptr(), 4);
-	}
-	if (magic == 0x33445758u) {
-		uint32_t user_len = 0;
-		memcpy(&user_len, in.ptr() + 4, 4);
-		if ((int)user_len > 0 && 8 + (int)user_len <= in.size()) {
-			PackedByteArray user_seg;
-			user_seg.resize((int)user_len);
-			memcpy(user_seg.ptrw(), in.ptr() + 8, (size_t)user_len);
-			// 1a) legacy 直封（kEntropyGen2）→ 解得即明文，不再 keystream 异或
-			Vector<uint8_t> plain;
-			if (dpapi_unprotect_with_entropy(user_seg, kEntropyGen2, plain)) {
-				out.resize((int)plain.size());
-				memcpy(out.ptrw(), plain.ptr(), (size_t)plain.size());
-				return out;
-			}
-			// 1b) 官方第二代封装（keystream2 + DPAPI 无熵）
-			out = device_unwrap2(user_seg);
-			if (!out.is_empty()) {
-				return out;
-			}
-			int machine_len = in.size() - 8 - (int)user_len;
-			if (machine_len > 0) {
-				PackedByteArray machine_seg;
-				machine_seg.resize(machine_len);
-				memcpy(machine_seg.ptrw(), in.ptr() + 8 + user_len, (size_t)machine_len);
-				return device_unwrap_m2(machine_seg);
-			}
-		}
+	// [修正 2026-11-18 二次] 官方 0x340DA40 与本函数逐指令对称：只做一次
+	//   CryptUnprotectData(pDataIn, szDataDescr=NULL, pOptionalEntropy=kEntropyGen1,
+	//                      NULL, NULL, CRYPTPROTECT_UI_FORBIDDEN)
+	// XWD3 容器由脚本层 守护.gd:device_unwrap_ex() 先按 magic 剥掉并分流到
+	// device_unwrap2 / device_unwrap_m2，不会进到这里，所以这里不做容器解析。
+	if (in.size() == 0) {
 		return out;
 	}
-	// 2) 裸 DPAPI blob：v1 熵 kEntropyGen1(pepper) → v2 熵 kEntropyGen2，任一试通即明文
-	if (util::looks_like_dpapi(in)) {
-		Vector<uint8_t> plain;
-		if (dpapi_unprotect_with_entropy(in, kEntropyGen1, plain) ||
-				dpapi_unprotect_with_entropy(in, kEntropyGen2, plain)) {
-			out.resize((int)plain.size());
-			memcpy(out.ptrw(), plain.ptr(), (size_t)plain.size());
-		}
+	Vector<uint8_t> cipher;
+	cipher.resize(in.size());
+	memcpy(cipher.ptrw(), in.ptr(), (size_t)in.size());
+	Vector<uint8_t> plain;
+	if (dpapi_unprotect_with_entropy(cipher, kEntropyGen1, plain)) {
+		out.resize((int)plain.size());
+		memcpy(out.ptrw(), plain.ptr(), (size_t)plain.size());
 		return out;
 	}
-	// 3) 历史兼容：早期自造 keystream1 裸异或写出过的值，只在读旧数据时兜底
-	uint8_t ks[32];
-	keystream1(device_tag(String()), ks);
-	out.resize(in.size());
-	uint8_t *w = out.ptrw();
-	for (int i = 0; i < in.size(); i++) {
-		w[i] = (uint8_t)(in[i] ^ ks[i % 32]);
+	// 兼容读取：历史自编译版曾用 kEntropyGen2 封装 0.bin 与 profile.cfg 的 wrapped_key。
+	// 官方版从不使用这把熵做 v1 段，但为了不丢用户既有的本地数据，读路径保留一次兜底。
+	if (dpapi_unprotect_with_entropy(cipher, kEntropyGen2, plain)) {
+		out.resize((int)plain.size());
+		memcpy(out.ptrw(), plain.ptr(), (size_t)plain.size());
 	}
-	// 解出来必须是 Variant 流；例外：32 字节裸密钥（profile.cfg 的 wrapped_key
-	// 封的就是 32 B 裸密钥，不是 var_to_bytes(dict)），不能误杀
-	if (!util::plain_is_decodable(out) && out.size() != 32) {
-		out = PackedByteArray();
-	}
+	// 早期“裸异或 keystream1”格式不再兜底：那种解出来的东西必然不是官方可读格式，
+	// 继续尝试只会让上层把坏数据当成好数据（上一版 T4_MARKS_BROKEN 的连带原因）。
 #else
 	out = in;
 #endif
 	return out;
 }
 
-// 带元信息的封装：字节容器 = [0]=版本(1) / [1..16]=设备标签前 16 字节 / [17..]=密文
+// [修正 2026-11-18 二次] 官方 0x340DCB0 只有一次调用：
+//   CryptProtectData(pDataIn = 输入, szDataDescr = L"ombrel",
+//       pOptionalEntropy = machine_secret32()（32 B）, NULL, NULL,
+//       dwFlags = 5 = CRYPTPROTECT_UI_FORBIDDEN | CRYPTPROTECT_LOCAL_MACHINE)
+// 不产任何自造头。上一版的 "[1][16B 标签]" 前缀属臆造：官方 device_unwrap_m
+// （0x340DED0）把整块交给 CryptUnprotectData，多 17 字节头会直接 DataInvalid。
+//
+// machine_secret32 官方由 0x340F6E0 派生（CryptAcquireContextW + CryptGetProvParam
+// 枚举本机 CSP 名 → 拼 "xiewa-machine2" + provider 名 → KDF 出 32 B），依赖运行时
+// CSP 列表，离线无法复刻；这里改用 0.bin 里的 32 B 设备种子（同为“本机 DPAPI 绑定的
+// 材料”），保住“本机可写可读、异机不可解”的语义，且不再破坏官方容器布局。
 PackedByteArray XiewaGuard::device_wrap_m(const PackedByteArray &in) {
 	PackedByteArray out;
 #ifdef WINDOWS_ENABLED
-	PackedByteArray cipher = device_wrap(in);
-	String tag = device_tag(String()).substr(0, 16);
-	out.resize(1 + 16 + cipher.size());
-	uint8_t *w = out.ptrw();
-	w[0] = 1;
-	for (int i = 0; i < 16; i++) {
-		w[1 + i] = i < tag.length() ? (uint8_t)tag[i] : 0;
+	uint8_t seed[32];
+	if (!device_seed32(seed)) {
+		return out;
 	}
-	for (int i = 0; i < cipher.size(); i++) {
-		w[17 + i] = cipher[i];
+	Vector<uint8_t> plain;
+	plain.resize(in.size());
+	if (in.size() > 0) {
+		memcpy(plain.ptrw(), in.ptr(), (size_t)in.size());
 	}
+	Vector<uint8_t> cipher;
+	if (!dpapi_protect_machine(plain, seed, cipher)) {
+		return out;
+	}
+	out.resize((int)cipher.size());
+	memcpy(out.ptrw(), cipher.ptr(), (size_t)cipher.size());
 #else
 	out = in;
 #endif
 	return out;
 }
 
-// 接受带标签的容器（>=17 字节）或裸密文两种输入
+// 官方 0x340DED0：一次 CryptUnprotectData(entropy = machine_secret32(), flags = 5)，
+// 解不开返回空（与 v1 user 段失败即空的行为一致，没有容器剥壳、没有 keystream 反异或）。
 PackedByteArray XiewaGuard::device_unwrap_m(const PackedByteArray &in) {
+	PackedByteArray out;
 #ifdef WINDOWS_ENABLED
-	// [修正 2026-11-16] 原程序 v1 机器级密文同样是 DPAPI blob，解不开就返回空
-	if (util::looks_like_dpapi(in)) {
-		return PackedByteArray();
+	if (in.size() == 0) {
+		return out;
 	}
-	if (in.size() >= 17 && in[0] == 1) {
-		PackedByteArray cipher;
-		cipher.resize(in.size() - 17);
-		for (int i = 0; i < cipher.size(); i++) {
-			cipher.set(i, in[17 + i]);
-		}
-		return device_unwrap(cipher);
+	uint8_t seed[32];
+	if (!device_seed32(seed)) {
+		return out;
 	}
+	Vector<uint8_t> cipher;
+	cipher.resize(in.size());
+	memcpy(cipher.ptrw(), in.ptr(), (size_t)in.size());
+	Vector<uint8_t> plain;
+	if (!dpapi_unprotect_machine(cipher, seed, plain)) {
+		return out;
+	}
+	out.resize((int)plain.size());
+	memcpy(out.ptrw(), plain.ptr(), (size_t)plain.size());
+#else
+	(void)in;
 #endif
-	return device_unwrap(in);
+	return out;
 }
 
 // =============================================================================
@@ -668,23 +729,65 @@ PackedByteArray XiewaGuard::device_unwrap_m(const PackedByteArray &in) {
 // =============================================================================
 String XiewaGuard::device_tag(const String &seed) {
 #ifdef WINDOWS_ENABLED
-	String acc;
-	// 脚本传入的 seed 作为前导材料（原程序 argc=1）
-	if (!seed.is_empty()) {
-		acc += seed + "|";
+	// [修正 2026-11-18 二次] 官方 0x340E0F0 逐指令实证，device_tag(path) 不是“拼系统信息再哈希”：
+	//   1) FileAccess 打开 path 读全部字节；
+	//   2) call device_unwrap（0x340DA40 = CryptUnprotectData + entropy kEntropyGen1）；
+	//   3) 解出长度必须 == 0x20，否则判失败；
+	//   4) 把该 32 B 填进 {buf[64]; len=32@64; pad; h[8]=SHA256 IV@72/88; tail@104} 结构，
+	//      调 0x2BFE6F0 / 0x2BFF3D0，输出 16 B；
+	//   5) 用 "0123456789abcdef" 把 16 B 转 32 个 hex 字符返回。
+	// 第 4 步是“SHA-256 上下文但只吐 16 B”，实测不等于 sha256/md5/sha1 的任意前缀
+	// （目标 b64dda373fad133 至今未被任何候选命中），说明它截断位置不标准。
+	// 该值只作 machine 段头与日志里的“设备代号”，官方解我方数据时不校验它
+	// （device_unwrap_m2 只跳过 17 字节头），因此这里用标准 SHA-256 取前 32 个 hex 字符：
+	// 长度、字符集、同机稳定性与官方一致。
+	String path = seed;
+	if (path.is_empty()) {
+		String base = OS::get_singleton()->get_environment("LOCALAPPDATA");
+		if (!base.is_empty()) {
+			path = base.replace("\\", "/") + "/" + vendor() + "/" + cache_dir() + "/0.bin";
+		}
 	}
-	acc += system_volume_serial() + "|";
-	acc += machine_guid() + "|";
-	acc += String::num_int64(OS::get_singleton()->get_processor_count()) + "|";
-	Dictionary mem = OS::get_singleton()->get_memory_info();
-	acc += String::num_uint64((uint64_t)(int64_t)mem.get("physical", 0)) + "|";
-	acc += util::system_dir() + "|";
-	acc += smbios_uuid();
-
+	PackedByteArray blob;
+	if (!path.is_empty()) {
+		Ref<FileAccess> f = FileAccess::open(path, FileAccess::READ);
+		if (!f.is_null()) {
+			blob = f->get_buffer((int)f->get_length());
+			f.unref();
+		}
+	}
 	uint8_t d[32];
-	CharString u8 = acc.utf8();
-	util::sha256(u8.get_data(), (size_t)u8.length(), d);
-	return util::to_hex32(d);
+	bool have_seed = false;
+	if (blob.size() > 0) {
+		Vector<uint8_t> plain;
+		if (dpapi_unprotect_with_entropy(blob, kEntropyGen1, plain) && plain.size() == 32) {
+			memcpy(d, plain.ptr(), 32);
+			have_seed = true;
+		}
+	}
+	if (!have_seed) {
+		// 与官方一致：种子缺失时现生成 32 B，用 device_wrap 封好写回该 path，
+		// 保证同一台机器后续每次得到同一个 tag。
+		for (int i = 0; i < 32; i++) {
+			d[i] = (uint8_t)(uint32_t)Math::rand();
+		}
+		if (!path.is_empty()) {
+			PackedByteArray raw;
+			raw.resize(32);
+			memcpy(raw.ptrw(), d, 32);
+			PackedByteArray wrapped = device_wrap(raw);
+			if (wrapped.size() > 0) {
+				Ref<FileAccess> f = FileAccess::open(path, FileAccess::WRITE);
+				if (!f.is_null()) {
+					f->store_buffer(wrapped);
+					f.unref();
+				}
+			}
+		}
+	}
+	uint8_t h[32];
+	util::sha256(d, 32, h);
+	return util::to_hex32(h).substr(0, 32);
 #else
 	(void)seed;
 	return String("unavailable");
