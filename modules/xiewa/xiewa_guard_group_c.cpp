@@ -51,6 +51,125 @@ String cache_root() {
 #endif
 }
 
+// 整机名单里只允许出现"警告级"证据码。
+// 官方 本机限制.machine_seal_all() 的判据是：整机名单 all 为真，并且 ev 里只要有一个码
+// 不等于 "X7L" 就返回 true —— 随后 数值守卫 就以 "M8" 封档（存档里写 x8/M8）。
+// 所以强码（N*/B*/T4*/M8 …）一旦落进整机记录，自编版和官方版下一次启动都会封 M8。
+// 这里把一切非警告码统一降级成 "X7L"（只警告、不封档），从源头掐断 M8。
+bool is_warn_code(const String &code) {
+	const String c = code.strip_edges();
+	return c == "X7L" || c == "S1" || c == "M1" || c == "U3";
+}
+
+String sanitize_ev_codes(const String &ev) {
+	Vector<String> parts = ev.split(",", false);
+	Vector<String> kept;
+	for (int i = 0; i < parts.size(); i++) {
+		String c = parts[i].strip_edges();
+		if (c.is_empty()) {
+			continue;
+		}
+		if (!is_warn_code(c)) {
+			c = "X7L";
+		}
+		if (!kept.has(c)) {
+			kept.push_back(c);
+		}
+	}
+	String out;
+	for (int i = 0; i < kept.size(); i++) {
+		if (i > 0) {
+			out += ",";
+		}
+		out += kept[i];
+	}
+	return out;
+}
+
+// 自编版自己的记账目录（放在 ombrel_cache 下的 local 子目录）。
+// 官方只认 ombrel_cache 根部的通道文件，不会把这里的记录当成整机名单。
+String devlimit_dir() {
+	return cache_root() + "/local";
+}
+
+// 官方口径的"整机名单"记录有两个落点，同名：
+//   ① 注册表 HKCU\Software\<vendor>\Cache 下的值（REG_BINARY）
+//   ② %LOCALAPPDATA%\<vendor>\cache 与 %PROGRAMDATA%\<vendor>\cache 下的 <name>.idx
+// 名字都由 name2 生成，形如 "xw2-" + 12 位十六进制；内容以 "XWD3" 魔数开头
+// （XWD3 就是官方 _DUAL_MAGIC3 = 0x33445758，所以不能只凭魔数判断 —— 存档/账本
+//  记录也用同一个魔数，靠 "xw2-" 名字前缀区分才不会误删存档）。
+//
+// 为什么要清：官方 本机限制.machine_seal_all() 只看"整机名单是否存在 + ev 是否非 X7L"。
+// 只要这条记录在，官方版每次启动都会以 M8 封档。
+bool purge_whole_machine_marks(const String &vendor_name) {
+	bool removed = false;
+#ifdef WINDOWS_ENABLED
+	// 键名与值名都是 ASCII，直接用 ANSI 版 API，省掉宽字符转换
+	String sub = String("Software\\") + vendor_name + "\\Cache";
+	HKEY key = nullptr;
+	if (RegOpenKeyExA(HKEY_CURRENT_USER, sub.utf8().get_data(), 0, KEY_ALL_ACCESS, &key) == ERROR_SUCCESS) {
+		Vector<String> hits;
+		DWORD index = 0;
+		char value_name[512];
+		DWORD value_len = 0;
+		DWORD value_type = 0;
+		BYTE data[2048];
+		DWORD data_len = 0;
+		while (true) {
+			value_len = 512;
+			data_len = sizeof(data);
+			LONG rc = RegEnumValueA(key, index, value_name, &value_len, nullptr, &value_type, data, &data_len);
+			if (rc != ERROR_SUCCESS) {
+				break;
+			}
+			index++;
+			String name = String(value_name);
+			if (!name.begins_with("xw2-")) {
+				continue;
+			}
+			if (value_type != REG_BINARY || data_len < 4) {
+				continue;
+			}
+			// 前 4 字节是不是 "XWD3"
+			if (!(data[0] == 'X' && data[1] == 'W' && data[2] == 'D' && data[3] == '3')) {
+				continue;
+			}
+			hits.push_back(name);
+		}
+		for (int i = 0; i < hits.size(); i++) {
+			RegDeleteValueA(key, hits[i].utf8().get_data());
+			removed = true;
+		}
+		RegCloseKey(key);
+	}
+#endif
+	// 同步删掉两个缓存目录下同名 .idx（注册表没了、文件还在，官方仍会读到）
+	const String dirs[2] = {
+		String(OS::get_singleton()->get_environment("LOCALAPPDATA")) + "/" + vendor_name + "/cache",
+		String(OS::get_singleton()->get_environment("PROGRAMDATA")) + "/" + vendor_name + "/cache",
+	};
+	for (int d = 0; d < 2; d++) {
+		if (dirs[d].length() <= 3 || !DirAccess::dir_exists_absolute(dirs[d])) {
+			continue;
+		}
+		Ref<DirAccess> da = DirAccess::open(dirs[d]);
+		if (da.is_null()) {
+			continue;
+		}
+		da->list_dir_begin();
+		String f = da->get_next();
+		while (!f.is_empty()) {
+			if (!da->current_is_dir() && f.begins_with("xw2-") && f.ends_with(".idx")) {
+				DirAccess::remove_absolute(dirs[d].path_join(f));
+				removed = true;
+			}
+			f = da->get_next();
+		}
+		da->list_dir_end();
+	}
+	return removed;
+}
+
 String machine_fp_impl() {
 #ifdef WINDOWS_ENABLED
 	String acc;
@@ -250,10 +369,20 @@ Dictionary XiewaGuard::devlimit_state() {
 	Dictionary out;
 	out["fp"] = machine_fp_impl();
 
+	// ① 自愈：官方口径的整机名单记录（"xw2-" 前缀 + XWD3 内容）只要还在，
+	//    官方版下次启动的 machine_seal_all() 就会判 M8 封档。每个进程只清一次。
+	static bool purged = false;
+	if (!purged) {
+		purged = true;
+		if (purge_whole_machine_marks(vendor())) {
+			XW_DEBUG_PRINT("[xiewa] 已清理遗留的整机名单记录，避免官方版继续 M8 封档");
+		}
+	}
+
 	Array recs;
 	String first_at;
 	String last_ev;
-	String dir = cache_root();
+	String dir = devlimit_dir();
 	Ref<DirAccess> da = DirAccess::open(dir);
 	if (da.is_valid()) {
 		da->list_dir_begin();
@@ -280,7 +409,9 @@ Dictionary XiewaGuard::devlimit_state() {
 							if (r.has("ev")) {
 								Variant evv = r["ev"];
 								if (evv.get_type() == Variant::STRING) {
-									last_ev = evv;
+									// 白名单归一：任何强码都降级成 X7L，状态里不再出现能触发 M8 的码
+									String raw_ev = evv;
+									last_ev = sanitize_ev_codes(raw_ev);
 								}
 							}
 						}
@@ -310,7 +441,11 @@ Dictionary XiewaGuard::devlimit_state() {
 //  [修正 2026-11-16] exe 类型表：argc=1，[返回=BOOL, 参数=STRING]
 // =============================================================================
 bool XiewaGuard::devlimit_mark(const String &event) {
-	if (event.is_empty()) {
+	// 白名单：整机名单只承载"警告级"证据码。
+	// 官方 machine_seal_all() 只认 X7L，其余码一律会封 M8；
+	// 而"封本档"由脚本层的 LOCAL_ONLY_CODES 处理，不需要写进整机名单。
+	String ev = sanitize_ev_codes(event);
+	if (ev.is_empty()) {
 		return false;
 	}
 
@@ -321,13 +456,14 @@ bool XiewaGuard::devlimit_mark(const String &event) {
 	};
 	String at = String::num_int64(now.year) + "-" + pad2(now.month) + "-" + pad2(now.day) + "T" +
 			pad2(now.hour) + ":" + pad2(now.minute) + ":" + pad2(now.second);
-	rec["ev"] = event;
+	rec["ev"] = ev;
 	rec["at"] = at;
 	rec["fp"] = machine_fp_impl();
 
-	String dir = cache_root();
+	// 记账只写自编版自己的 local 子目录，不落官方通道（官方通道写不得，写了官方验不过）
+	String dir = devlimit_dir();
 	DirAccess::make_dir_recursive_absolute(dir);
-	String path = dir + "/devlimit.txt";
+	String path = dir + "/devlimit.json";
 	Ref<FileAccess> fa = FileAccess::open(path, FileAccess::WRITE);
 	if (fa.is_null()) {
 		return false;
@@ -346,36 +482,31 @@ bool XiewaGuard::devlimit_mark(const String &event) {
 //   [重要] 早先的实现会删除 cache_root() 下的**全部**文件，那会把同目录的
 //   0.bin、*.idx、snap\ 一并删掉，直接导致"存档记录已被清理，无法读取"。
 bool XiewaGuard::devlimit_clear(const String &token, const String &scope) {
-	String dir = cache_root();
-	if (!DirAccess::dir_exists_absolute(dir)) {
-		// 没有记录目录等价于"已清理"，脚本要的是 true 才能继续
-		return true;
-	}
-	Ref<DirAccess> da = DirAccess::open(dir);
-	if (da.is_null()) {
-		return false;
-	}
-	da->list_dir_begin();
-	String f = da->get_next();
-	while (!f.is_empty()) {
-		if (!da->current_is_dir() && (f.begins_with("devlimit") || f.begins_with("devheal") || f.begins_with("unseal"))) {
-			DirAccess::remove_absolute(dir.path_join(f));
+	// 只清理"限制记录"类文件，不碰同目录的 0.bin / *.idx / snap\ ——
+	// 早前删整目录会导致"存档记录已被清理，无法读取"。
+	const String scan_dirs[2] = { cache_root(), devlimit_dir() };
+	for (int d = 0; d < 2; d++) {
+		String dir = scan_dirs[d];
+		if (!DirAccess::dir_exists_absolute(dir)) {
+			continue;
 		}
-		f = da->get_next();
+		Ref<DirAccess> da = DirAccess::open(dir);
+		if (da.is_null()) {
+			continue;
+		}
+		da->list_dir_begin();
+		String f = da->get_next();
+		while (!f.is_empty()) {
+			if (!da->current_is_dir() && (f.begins_with("devlimit") || f.begins_with("devheal") || f.begins_with("unseal"))) {
+				DirAccess::remove_absolute(dir.path_join(f));
+			}
+			f = da->get_next();
+		}
+		da->list_dir_end();
 	}
-	da->list_dir_end();
 
-#ifdef WINDOWS_ENABLED
-	// 注册表侧：清 devlimit / devheal 通道值（name2 出来的是 xw2-<12hex> 形态）
-	String path = String("Software\\") + vendor() + "\\" + reg_subkey();
-	if (!scope.is_empty()) {
-		util::reg_delete_value(HKEY_CURRENT_USER, path, name2("devlimit", scope));
-		util::reg_delete_value(HKEY_CURRENT_USER, path, name2("devheal", scope));
-	}
-	if (!token.is_empty() && token != scope) {
-		util::reg_delete_value(HKEY_CURRENT_USER, path, name2("devlimit", token));
-	}
-#endif
+	// 官方口径的整机名单记录（"xw2-" 前缀 + XWD3 内容）一并清掉
+	purge_whole_machine_marks(vendor());
 	// "XIEWA-UNSEAL|" 前缀的令牌本身不落盘，这里只保留其拼装语义用于审计
 	(void)token;
 	(void)scope;
