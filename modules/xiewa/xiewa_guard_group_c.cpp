@@ -57,45 +57,77 @@ String cache_root() {
 #endif
 }
 
-// 整机名单里只允许出现"警告级"证据码。
-// 官方 本机限制.machine_seal_all() 的判据是：整机名单 all 为真，并且 ev 里只要有一个码
-// 不等于 "X7L" 就返回 true —— 随后 数值守卫 就以 "M8" 封档（存档里写 x8/M8）。
-// 所以强码（N*/B*/T4*/M8 …）一旦落进整机记录，自编版和官方版下一次启动都会封 M8。
-// 这里把一切非警告码统一降级成 "X7L"（只警告、不封档），从源头掐断 M8。
-bool is_warn_code(const String &code) {
-	const String c = code.strip_edges();
-	return c == "X7L" || c == "S1" || c == "M1" || c == "U3";
-}
-
+// 官方 本机限制.machine_seal_all() 的判据只有两条：
+//   ① machine_all() 为真（整机名单里有记录）
+//   ② ev 里存在任意一个不等于 "X7L" 的码
+// 只要两条同时成立，数值守卫 的 修改器痕迹() 就塞进 "M8"，随后以 x8 封档。
+// 早先这里把 S1 / M1 / U3 当"警告码"留着，可它们都不等于 X7L —— 等于亲手把 M8 打开。
+// 现在一律归一成 "X7L"：整机名单只表达"警告过一次"，不再承载任何能触发封档的码。
 String sanitize_ev_codes(const String &ev) {
-	Vector<String> parts = ev.split(",", false);
-	Vector<String> kept;
-	for (int i = 0; i < parts.size(); i++) {
-		String c = parts[i].strip_edges();
-		if (c.is_empty()) {
-			continue;
-		}
-		if (!is_warn_code(c)) {
-			c = "X7L";
-		}
-		if (!kept.has(c)) {
-			kept.push_back(c);
-		}
+	if (ev.strip_edges().is_empty()) {
+		return String();
 	}
-	String out;
-	for (int i = 0; i < kept.size(); i++) {
-		if (i > 0) {
-			out += ",";
-		}
-		out += kept[i];
-	}
-	return out;
+	return String("X7L");
 }
 
 // 自编版自己的记账目录（放在 ombrel_cache 下的 local 子目录）。
 // 官方只认 ombrel_cache 根部的通道文件，不会把这里的记录当成整机名单。
 String devlimit_dir() {
 	return cache_root() + "/local";
+}
+
+// -----------------------------------------------------------------------------
+// 诊断日志
+// release 版 XW_DEBUG_PRINT 是空语句，print_line 调不起来，出问题只能靠落盘看。
+// 只记"状态发生变化"的少量事件（清理命中、自愈写入、首次状态快照），不会狂写。
+// 落点：%APPDATA%\Ombrel\rt\xiewa_module.log（与游戏自己的日志同目录，方便一起发）
+// -----------------------------------------------------------------------------
+uint64_t now_ms() {
+	OS *os = OS::get_singleton();
+	return os != nullptr ? os->get_ticks_msec() : 0;
+}
+
+String diag_log_path() {
+#ifdef WINDOWS_ENABLED
+	String base = OS::get_singleton()->get_environment("APPDATA");
+	if (base.is_empty()) {
+		return String();
+	}
+	return base + "/Ombrel/rt/xiewa_module.log";
+#else
+	return String();
+#endif
+}
+
+String now_stamp() {
+	OS::DateTime t = OS::get_singleton()->get_datetime();
+	auto p2 = [](int v) -> String { return v < 10 ? String("0") + String::num_int64(v) : String::num_int64(v); };
+	return String::num_int64(t.year) + "-" + p2(t.month) + "-" + p2(t.day) + " " +
+			p2(t.hour) + ":" + p2(t.minute) + ":" + p2(t.second);
+}
+
+// 追加一行。FileAccess 没有 APPEND 模式，只能"读旧 + 重写"，
+// 所以设了 256 KB 上限，超出时只保留最后一半，避免无限膨胀。
+void diag(const String &line) {
+	const String path = diag_log_path();
+	if (path.is_empty() || !DirAccess::dir_exists_absolute(path.get_base_dir())) {
+		return;
+	}
+	String old;
+	if (FileAccess::exists(path)) {
+		Ref<FileAccess> rf = FileAccess::open(path, FileAccess::READ);
+		if (rf.is_valid()) {
+			old = rf->get_as_text();
+			if (old.length() > 262144) {
+				old = old.substr(old.length() - 131072);
+			}
+		}
+	}
+	Ref<FileAccess> wf = FileAccess::open(path, FileAccess::WRITE);
+	if (wf.is_valid()) {
+		wf->store_string(old + "[" + now_stamp() + "] " + line + "\n");
+		wf->flush();
+	}
 }
 
 // 官方口径的"整机名单"记录有两个落点，同名：
@@ -107,8 +139,8 @@ String devlimit_dir() {
 //
 // 为什么要清：官方 本机限制.machine_seal_all() 只看"整机名单是否存在 + ev 是否非 X7L"。
 // 只要这条记录在，官方版每次启动都会以 M8 封档。
-bool purge_whole_machine_marks(const String &vendor_name) {
-	bool removed = false;
+int purge_whole_machine_marks(const String &vendor_name) {
+	int removed = 0;
 #ifdef WINDOWS_ENABLED
 	// 键名与值名都是 ASCII，直接用 ANSI 版 API，省掉宽字符转换
 	String sub = String("Software\\") + vendor_name + "\\Cache";
@@ -144,7 +176,7 @@ bool purge_whole_machine_marks(const String &vendor_name) {
 		}
 		for (int i = 0; i < hits.size(); i++) {
 			RegDeleteValueA(key, hits[i].utf8().get_data());
-			removed = true;
+			removed++;
 		}
 		RegCloseKey(key);
 	}
@@ -167,7 +199,37 @@ bool purge_whole_machine_marks(const String &vendor_name) {
 		while (!f.is_empty()) {
 			if (!da->current_is_dir() && f.begins_with("xw2-") && f.ends_with(".idx")) {
 				DirAccess::remove_absolute(dirs[d].path_join(f));
-				removed = true;
+				removed++;
+			}
+			f = da->get_next();
+		}
+		da->list_dir_end();
+	}
+	return removed;
+}
+
+// 清理自编版自己留下的记账文件（devlimit* / devheal* / unseal*）。
+// 为什么要清：官方 EXE 的 native 与这里共用 cache_root()/local 这个目录，
+// 任何一条 devlimit*.json 都会让官方 devlimit_state()["all"] 变 true；
+// 一旦 all=true 再加上一个非 X7L 的码，官方就 M8 封档。所以这份"遗留"必须清掉。
+int purge_own_bookkeeping() {
+	int removed = 0;
+	const String dirs[2] = { devlimit_dir(), cache_root() };
+	for (int d = 0; d < 2; d++) {
+		if (dirs[d].length() <= 3 || !DirAccess::dir_exists_absolute(dirs[d])) {
+			continue;
+		}
+		Ref<DirAccess> da = DirAccess::open(dirs[d]);
+		if (da.is_null()) {
+			continue;
+		}
+		da->list_dir_begin();
+		String f = da->get_next();
+		while (!f.is_empty()) {
+			if (!da->current_is_dir() && (f.begins_with("devlimit") || f.begins_with("devheal") || f.begins_with("unseal"))) {
+				if (DirAccess::remove_absolute(dirs[d].path_join(f)) == OK) {
+					removed++;
+				}
 			}
 			f = da->get_next();
 		}
@@ -192,14 +254,12 @@ bool purge_whole_machine_marks(const String &vendor_name) {
 //   "unsealed_at 非空 且 未封印 且 回执验不过" → 命中就给 U3，
 // 而 U3 属于 LOCAL_ONLY_CODES → 立刻再封本档。所以不能留半点"解封过"的痕迹，
 // 只能把整组封印字段整体回到"从未封印"的样子（这也是官方 解封() 之外唯一自洽的形态）。
-bool heal_account_seal_once() {
-	static bool done = false;
-	static int tries = 0;
-	if (done || tries >= 6) {
-		return false;
-	}
-	tries++;
-
+// 次数上限是历史上最大的坑：开机早期 devlimit_state() 会被 外挂开机检查 / 开机扫档案 调用，
+// 那时档案还没打开（has_active_profile 为 false），旧实现"最多 6 次尝试"会在一瞬间被白白耗光，
+// 等真正读档、真正需要清封印时已经彻底放弃 —— 这就是"官方封完、自编再启动仍然封着"的直接原因。
+// 现在：不设上限、按时间节流、前两次延后写之后改立即写，并且每次调用都重新读账号段，
+// 只有读到干净状态才停手（天然带写后校验）。
+bool heal_account_seal(bool p_immediate, int p_attempt) {
 	MainLoop *ml = OS::get_singleton()->get_main_loop();
 	SceneTree *tree = Object::cast_to<SceneTree>(ml);
 	if (tree == nullptr) {
@@ -209,30 +269,55 @@ bool heal_account_seal_once() {
 	if (root_window == nullptr) {
 		return false;
 	}
-	// 必须档案真的打开过，否则会把空段写回去
 	Node *lsm = root_window->get_node_or_null(NodePath("LocalSaveManager"));
 	if (lsm == nullptr || !lsm->has_method("get_account_section") || !lsm->has_method("set_account_section")) {
 		return false;
 	}
+	bool changed = false;
+
+	// ① 申诉上下文。数值守卫.已封印():1193 只要 has_guard_appeal_context() 为真就直接返回 true，
+	//    光清账号段不够，这层内存上下文同样会让界面继续弹封印页。
+	if (lsm->has_method("has_guard_appeal_context")) {
+		Variant hv = lsm->call("has_guard_appeal_context");
+		if (hv.get_type() == Variant::BOOL && bool(hv) && lsm->has_method("clear_guard_appeal_context")) {
+			lsm->call("clear_guard_appeal_context");
+			changed = true;
+			diag("[heal] 清除申诉上下文 _guard_appeal_context");
+		}
+	}
+
+	// ② 账号段：必须档案真的打开过，否则会把空段写回去
+	if (!lsm->has_method("has_active_profile")) {
+		return changed;
+	}
 	Variant active_v = lsm->call("has_active_profile");
 	if (active_v.get_type() != Variant::BOOL || !bool(active_v)) {
-		return false;
+		return changed;
 	}
 
 	Variant cur_v = lsm->call("get_account_section", String("anti_ce"), Variant(Dictionary()));
 	if (cur_v.get_type() != Variant::DICTIONARY) {
-		return false;
+		return changed;
 	}
 	Dictionary ac = cur_v;
 
 	const bool has_seal = bool(ac.get("sealed", false)) || ac.has("seal_type") || ac.has("appeal") ||
 			ac.has("unsealed_at") || ac.has("ur") || ac.has("x7") || ac.has("x8") || ac.has("reason");
-	if (!has_seal) {
-		done = true; // 已经是干净状态
-		return false;
+	// 除了"已封印"，还有三类"会被判封"的残留，必须一起清：
+	//   client_mod        —— 客户端校验（globals/客户端校验.gd：可执行哈希不在官方白名单 → "B"）
+	//                        warned>=1 的**下一次**启动会直接 _置封印(category="client_mod")。
+	//                        自编 exe 的哈希永远不在官方白名单，这条路径每启动一次就攒一次，
+	//                        不清就等于"第二/第三次启动必封"。
+	//   closes/tool_hits  —— 累计"数值被修改 / 工具痕迹"次数，攒够阈值就 数值守卫:1174 封档。
+	//   tamper_pending    —— 待处理的篡改标记。
+	const bool has_client = ac.has("client_mod") || (int)ac.get("client_mod_warned", 0) != 0;
+	const bool has_counters = (int)ac.get("closes", 0) != 0 || (int)ac.get("tool_hits", 0) != 0 ||
+			(int)ac.get("tamper_pending", 0) != 0 || bool(ac.get("repair_pending", false));
+	if (!has_seal && !has_client && !has_counters) {
+		return changed; // 已经是干净状态
 	}
 
-	// 只清"封印状态"本身；pid / ob / entry_audit / audit_r2 / nonce 等审计字段原样保留
+	// 只清"会被判封"的字段；pid / ob / entry_audit / audit_r2 / nonce 等审计字段原样保留
 	ac["sealed"] = false;
 	ac["closes"] = 0;
 	ac["tool_hits"] = 0;
@@ -247,12 +332,41 @@ bool heal_account_seal_once() {
 		ac.erase(String(k));
 	}
 
-	// 延后到本帧末尾再写：触发点通常落在读档流程里，立刻 flush 会和正在进行的
-	// 存档提交互相踩（历史上"写档耗时/未提交本次存档"就是这么来的）
-	lsm->call_deferred("set_account_section", String("anti_ce"), Variant(ac), Variant(true));
-	done = true;
-	XW_DEBUG_PRINT("[xiewa] 已清除存档账号段里的封印状态（sealed/x8/appeal/unsealed_at），官方版可直接读这份档");
-	return true;
+	const String keys = String(has_seal ? "封印" : "") + String(has_client ? "+客户端警告" : "") +
+			String(has_counters ? "+累计计数" : "");
+
+	if (p_immediate) {
+		lsm->call("set_account_section", String("anti_ce"), Variant(ac), Variant(true));
+	} else {
+		// 延后 + 不强制 flush：触发点通常落在读档流程里，立刻落盘会和正在进行的
+		// 存档提交互相踩（历史上"写档耗时 / 未提交本次存档"就是这么来的）；
+		// 不强制 flush 时只是把段标记为脏，随正常存档周期写下去，IO 也不会爆。
+		lsm->call_deferred("set_account_section", String("anti_ce"), Variant(ac), Variant(false));
+	}
+	changed = true;
+	if (p_attempt <= 10 || (p_attempt % 20) == 0) {
+		diag(String("[heal] 第") + String::num_int64(p_attempt) + "次清理账号段封印字段 [" + keys + "]" +
+				(p_immediate ? "（立即落盘）" : "（延后落盘）"));
+	}
+	return changed;
+}
+
+// 节流调用点：devlimit_state() / devlimit_mark() / machine_fp() 都会调。
+// 前 40 次 250ms 一次（覆盖"开机 → 真正读档"这一段），之后退到 2 秒一次，永不停。
+// 注意：档案没打开时这里什么也不做（has_active_profile 为 false），不会浪费次数。
+void maybe_heal_account_seal() {
+	static int attempt = 0;
+	static uint64_t last_ms = 0;
+	uint64_t t = now_ms();
+	uint64_t gap = attempt < 40 ? 250 : 2000;
+	if (last_ms != 0 && t - last_ms < gap) {
+		return;
+	}
+	last_ms = t;
+	attempt++;
+	// 头两次先延后（避开读档流程），第 3~8 次强制落盘（覆盖"刚封完就关档"的场景），
+	// 之后退成延后脏写，靠正常存档周期写下去，避免 250ms 一次的 IO 抖动。
+	heal_account_seal(attempt > 2 && attempt <= 8, attempt);
 }
 
 String machine_fp_impl() {
@@ -365,6 +479,10 @@ Array list_bans() {
 //  CS 包裹 → 0x39054B0 取全局 → 副本扫描 → if (flags & 2) 把返回值收敛到 0x63
 // =============================================================================
 int XiewaGuard::bridge_check(int flags) {
+	// 数值守卫.修改器痕迹() 每次开档都会先问 bridge_check（has_v3 分支），
+	// 这个点是"档案数据已载入、封印判定之前"的时机，适合推进一次封印自愈。
+	maybe_heal_account_seal();
+	(void)flags;
 	return 0;
 	// int ret = flags;
 // 	if ((flags & 2) != 0) {
@@ -447,82 +565,57 @@ int XiewaGuard::engine_flags() {
 //  [修正 2026-11-16] devlimit_state 的 exe 类型表是 [返回=DICTIONARY]
 // =============================================================================
 String XiewaGuard::machine_fp() {
+	// 数值守卫 开机扫档案(:498) / 联网认证(:221) 都会先问 machine_fp，
+	// 在这里顺带推进一次封印自愈，让自愈的触发点早于任何 M8 判定。
+	maybe_heal_account_seal();
 	return machine_fp_impl();
 }
 
 Dictionary XiewaGuard::devlimit_state() {
 	Dictionary out;
-	out["fp"] = machine_fp_impl();
+	const String fp = machine_fp_impl();
+	out["fp"] = fp;
 
-	// ① 自愈：官方口径的整机名单记录（"xw2-" 前缀 + XWD3 内容）只要还在，
-	//    官方版下次启动的 machine_seal_all() 就会判 M8 封档。每个进程只清一次。
-	static bool purged = false;
-	if (!purged) {
-		purged = true;
-		if (purge_whole_machine_marks(vendor())) {
-			XW_DEBUG_PRINT("[xiewa] 已清理遗留的整机名单记录，避免官方版继续 M8 封档");
+	static uint64_t last_purge_ms = 0;
+	static uint64_t last_diag_ms = 0;
+	static bool diag_inited = false;
+	uint64_t t = now_ms();
+
+	// ① 周期性清理官方口径的整机名单（注册表 xw2-* + XWD3、两个 cache 目录下 xw2-*.idx）。
+	//    旧实现"每进程只清一次"，二次启动/二次封印后就再也不管了；现在 1s 节流常驻。
+	int removed = 0;
+	if (last_purge_ms == 0 || t - last_purge_ms > 1000) {
+		last_purge_ms = t;
+		removed = purge_whole_machine_marks(vendor()) + purge_own_bookkeeping();
+		if (removed > 0) {
+			diag(String("[purge] 清理遗留整机名单 / 记账文件 ") + String::num_int64(removed) + " 条");
 		}
 	}
 
-	// ② 自愈：历史封档写进存档账号段的部分不会因名单被清空而消失，
-	//    这里在读档后的第一次 state 询问时把封印状态整体清回"从未封印"。
-	//    官方原版 EXE 之后读同一份档，既看不到 sealed，也不会被判 U3。
-	heal_account_seal_once();
+	// ② 账号段封印自愈：节流常驻、无次数上限，档案一打开就会重试到读不到封印字段为止
+	maybe_heal_account_seal();
 
-	Array recs;
-	String first_at;
-	String last_ev;
-	String dir = devlimit_dir();
-	Ref<DirAccess> da = DirAccess::open(dir);
-	if (da.is_valid()) {
-		da->list_dir_begin();
-		String f = da->get_next();
-		while (!f.is_empty()) {
-			if (!da->current_is_dir() && f.begins_with("devlimit")) {
-				Ref<FileAccess> fa = FileAccess::open(dir.path_join(f), FileAccess::READ);
-				if (fa.is_valid()) {
-					JSON j;
-					if (j.parse(fa->get_as_text()) == OK) {
-						Variant parsed = j.get_data();
-						recs.push_back(parsed);
-						if (parsed.get_type() == Variant::DICTIONARY) {
-							Dictionary r = parsed;
-							if (r.has("at")) {
-								Variant av = r["at"];
-								if (av.get_type() == Variant::STRING) {
-									String at = av;
-									if (first_at.is_empty() || at < first_at) {
-										first_at = at;
-									}
-								}
-							}
-							if (r.has("ev")) {
-								Variant evv = r["ev"];
-								if (evv.get_type() == Variant::STRING) {
-									// 白名单归一：任何强码都降级成 X7L，状态里不再出现能触发 M8 的码
-									String raw_ev = evv;
-									last_ev = sanitize_ev_codes(raw_ev);
-								}
-							}
-						}
-					}
-				}
-			}
-			f = da->get_next();
-		}
-		da->list_dir_end();
-	}
-
-	// 脚本契约：本机限制.gd 用 get("all", false) 判是否受限，
-	// 并直接取 ev / first / need_d / need_n 这几个键，缺键会让语义整体失效。
-	out["records"] = recs;
-	out["count"] = recs.size();
-	out["all"] = recs.size() > 0;
-	out["ev"] = last_ev;
-	out["first"] = recs.is_empty(); // true = 尚无任何限制记录
-	out["need_d"] = recs.size(); // 已记录的天数
-	out["need_n"] = recs.size(); // 已记录的次数
+	// ③ 固定返回"整机无限制"。这就是 M8 的开关本身：
+	//    官方 本机限制.gd machine_all() = enabled() && devlimit_state()["all"]；
+	//    machine_seal_all() = machine_all() && ev 里存在 != "X7L" 的码 → 数值守卫 记 M8 → x8 封档。
+	//    旧实现把 all 算成"自己目录里有几条 devlimit*.json"，等于自编版自己记一条事件
+	//    就把 M8 开关打开（完全自伤，与官方是否在线无关）。这里 all 恒 false、ev 恒空，
+	//    脚本层 machine_all() 永远为假，M8 在自编版这一侧从源头不可能成立。
+	//    脚本契约仍完整给出：本机限制.gd 取 all / ev / first / need_d / need_n 五键。
+	out["records"] = Array();
+	out["count"] = 0;
+	out["all"] = false;
+	out["ev"] = String();
+	out["first"] = true; // true = 尚无任何限制记录
+	out["need_d"] = 0;
+	out["need_n"] = 0;
 	out["ok"] = true;
+
+	if (!diag_inited || t - last_diag_ms > 5000) {
+		diag_inited = true;
+		last_diag_ms = t;
+		diag(String("[state] all=false ev=\"\" fp=") + fp + (removed > 0 ? " (刚清过名单)" : ""));
+	}
 	return out;
 }
 
@@ -531,35 +624,35 @@ Dictionary XiewaGuard::devlimit_state() {
 //  [修正 2026-11-16] exe 类型表：argc=1，[返回=BOOL, 参数=STRING]
 // =============================================================================
 bool XiewaGuard::devlimit_mark(const String &event) {
-	// 白名单：整机名单只承载"警告级"证据码。
-	// 官方 machine_seal_all() 只认 X7L，其余码一律会封 M8；
-	// 而"封本档"由脚本层的 LOCAL_ONLY_CODES 处理，不需要写进整机名单。
-	String ev = sanitize_ev_codes(event);
-	if (ev.is_empty()) {
+	// 关键改动：这里**不再落任何文件**。
+	// 自编模块与官方 EXE 共用同一套 native 契约、同一个路径：
+	//   cache_root()   = %APPDATA%\Ombrel\rt\ombrel_cache
+	//   devlimit_dir() = cache_root()/local
+	// 旧实现每记一次事件就在 devlimit_dir() 里写一条 devlimit.json，于是
+	//   自编版 devlimit_state()["all"] = "有记录" → true
+	//   **官方 EXE 里同一份 native 逻辑读同一目录 → all 也是 true**
+	// 这时只要 ev 里有一个不等于 X7L 的码，官方就判 machine_seal_all() → M8 → x8 封档。
+	// 换句话说：自编版留的记账文件本身就是把刀递给官方。现在只写诊断日志，
+	// 同时把本地遗留的 devlimit* / devheal* / unseal* 记账文件删掉，
+	// 让官方读到的"整机名单"永远是空的（all=false）。
+	if (event.strip_edges().is_empty()) {
 		return false;
 	}
+	const String ev = sanitize_ev_codes(event);
+	diag(String("[mark] 记事件已降级为日志（不落盘） 原始=") + event + " 归一=" + (ev.is_empty() ? String("空") : ev));
 
-	Dictionary rec;
-	OS::DateTime now = OS::get_singleton()->get_datetime();
-	auto pad2 = [](int p_v) -> String {
-		return p_v < 10 ? String("0") + String::num_int64(p_v) : String::num_int64(p_v);
-	};
-	String at = String::num_int64(now.year) + "-" + pad2(now.month) + "-" + pad2(now.day) + "T" +
-			pad2(now.hour) + ":" + pad2(now.minute) + ":" + pad2(now.second);
-	rec["ev"] = ev;
-	rec["at"] = at;
-	rec["fp"] = machine_fp_impl();
-
-	// 记账只写自编版自己的 local 子目录，不落官方通道（官方通道写不得，写了官方验不过）
-	String dir = devlimit_dir();
-	DirAccess::make_dir_recursive_absolute(dir);
-	String path = dir + "/devlimit.json";
-	Ref<FileAccess> fa = FileAccess::open(path, FileAccess::WRITE);
-	if (fa.is_null()) {
-		return false;
+	static uint64_t last_ms = 0;
+	uint64_t t = now_ms();
+	if (last_ms == 0 || t - last_ms > 200) {
+		last_ms = t;
+		int removed = purge_own_bookkeeping();
+		if (removed > 0) {
+			diag(String("[mark] 删除遗留记账文件 ") + String::num_int64(removed) + " 条");
+		}
 	}
-	fa->store_string(JSON::stringify(rec));
-	fa->flush();
+
+	// 刚记过事件，顺手把可能残留的封印状态再清一遍（mark 往往发生在 M8 判定之后）
+	maybe_heal_account_seal();
 	return true;
 }
 
@@ -598,7 +691,7 @@ bool XiewaGuard::devlimit_clear(const String &token, const String &scope) {
 	// 官方口径的整机名单记录（"xw2-" 前缀 + XWD3 内容）一并清掉
 	purge_whole_machine_marks(vendor());
 	// 解封/解除这条路径上也把账号段的封印状态清干净（否则官方版还会接着判已封印）
-	heal_account_seal_once();
+	heal_account_seal(true, 1);
 	// "XIEWA-UNSEAL|" 前缀的令牌本身不落盘，这里只保留其拼装语义用于审计
 	(void)token;
 	(void)scope;
