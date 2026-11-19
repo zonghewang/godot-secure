@@ -47,10 +47,13 @@
 #include "xiewa_guard.h"
 #include "xiewa_util.h"
 
+#include "core/engine.h"
 #include "core/object/ref_counted.h"
 #include "core/string/ustring.h"
 #include "core/variant/dictionary.h"
 #include "core/variant/variant.h"
+#include "scene/main/node.h"
+#include "scene/main/scene_tree.h"
 
 #if __has_include("core/variant/json.h")
 #include "core/variant/json.h"
@@ -199,6 +202,218 @@ int snap_payload_sections(const String &p_payload) {
 	return t.size();
 }
 
+// ---------------------------------------------------------------------------
+//  账本经济计数：复刻 res://globals/经济账本.gd 的 计数() / 经济计数() 口径
+//    账户段 a:  account_currencies / account_storehouse
+//    角色段 cN: inventory / equipment / progression / shenshou / guardian
+//  计数键形如 "a:account_currencies|cur|金币"，与官方 native payload 同构。
+//  快照 payload 必须用真实计数：官方 snap_open 会拿脚本传来的 live 逐键比对，
+//  塞假数据会导致官方把账本判为 diff 并封印（ac.sealed=true）。
+// ---------------------------------------------------------------------------
+int64_t snap_int_of(const Variant &p_v) {
+	Variant::Type t = p_v.get_type();
+	if (t == Variant::INT) {
+		return (int64_t)p_v;
+	}
+	if (t == Variant::FLOAT) {
+		return (int64_t)(double)p_v;
+	}
+	if (t == Variant::BOOL) {
+		return (bool)p_v ? 1 : 0;
+	}
+	return 0;
+}
+
+void snap_add(Dictionary &r_out, const String &p_key, int64_t p_n) {
+	if (p_n == 0) {
+		return;
+	}
+	int64_t cur = 0;
+	if (r_out.has(p_key)) {
+		cur = snap_int_of(r_out[p_key]);
+	}
+	r_out[p_key] = cur + p_n;
+}
+
+Dictionary snap_count_section(const String &p_key, const Variant &p_value) {
+	Dictionary out;
+	int sep = p_key.find(":");
+	if (sep < 0) {
+		return out;
+	}
+	String section = p_key.substr(sep + 1);
+	String pre = p_key + "|";
+	if (section == String("account_currencies")) {
+		if (p_value.get_type() == Variant::DICTIONARY) {
+			Dictionary v = p_value;
+			Array ks = v.keys();
+			for (int i = 0; i < ks.size(); i++) {
+				Variant k = ks[i];
+				Variant val = v[k];
+				Variant::Type vt = val.get_type();
+				if (vt == Variant::INT || vt == Variant::FLOAT) {
+					snap_add(out, pre + String("cur|") + String(k), snap_int_of(val));
+				}
+			}
+		}
+	} else if (section == String("progression")) {
+		if (p_value.get_type() == Variant::DICTIONARY) {
+			Dictionary pd = p_value;
+			if (pd.has("kungfu_bean")) {
+				snap_add(out, pre + String("cur|bean"), snap_int_of(pd["kungfu_bean"]));
+			}
+			if (pd.has("level")) {
+				snap_add(out, pre + String("lv|level"), snap_int_of(pd["level"]));
+			}
+			if (pd.has("exp")) {
+				snap_add(out, pre + String("exp|cur"), snap_int_of(pd["exp"]));
+			}
+			if (pd.has("total_exp")) {
+				snap_add(out, pre + String("exp|total"), snap_int_of(pd["total_exp"]));
+			}
+		}
+	} else if (section == String("inventory")) {
+		if (p_value.get_type() == Variant::DICTIONARY) {
+			Dictionary inv = p_value;
+			const char *arr_keys[3] = { "equipment", "items", "materials" };
+			for (int a = 0; a < 3; a++) {
+				String ak = String(arr_keys[a]);
+				if (!inv.has(ak) || inv[ak].get_type() != Variant::ARRAY) {
+					continue;
+				}
+				Array ea = inv[ak];
+				for (int i = 0; i < ea.size(); i++) {
+					if (ea[i].get_type() != Variant::DICTIONARY) {
+						continue;
+					}
+					Dictionary ed = ea[i];
+					int64_t id = ed.has("id") ? snap_int_of(ed["id"]) : 0;
+					int64_t cnt = (ak == String("equipment")) ? 1 : (ed.has("count") ? snap_int_of(ed["count"]) : 1);
+					snap_add(out, pre + ak + String("|") + itos(id), cnt);
+				}
+			}
+		}
+	} else if (section == String("equipment")) {
+		if (p_value.get_type() == Variant::DICTIONARY) {
+			Dictionary eq = p_value;
+			Array slots = eq.keys();
+			for (int i = 0; i < slots.size(); i++) {
+				Variant e = eq[slots[i]];
+				if (e.get_type() != Variant::DICTIONARY) {
+					continue;
+				}
+				Dictionary ed = e;
+				int64_t id = ed.has("id") ? snap_int_of(ed["id"]) : 0;
+				if (id > 0) {
+					snap_add(out, pre + String("worn|") + itos(id), 1);
+				}
+			}
+		}
+	} else if (section == String("shenshou")) {
+		if (p_value.get_type() == Variant::DICTIONARY) {
+			Dictionary sd = p_value;
+			if (sd.has("pets") && sd["pets"].get_type() == Variant::DICTIONARY) {
+				Dictionary pets = sd["pets"];
+				Array pids = pets.keys();
+				for (int i = 0; i < pids.size(); i++) {
+					snap_add(out, pre + String("pet|") + String(pids[i]), 1);
+				}
+			}
+		}
+	} else if (section == String("guardian")) {
+		if (p_value.get_type() == Variant::DICTIONARY) {
+			Dictionary gd = p_value;
+			if (gd.has("guardians") && gd["guardians"].get_type() == Variant::DICTIONARY) {
+				Dictionary gds = gd["guardians"];
+				Array gids = gds.keys();
+				for (int i = 0; i < gids.size(); i++) {
+					snap_add(out, pre + String("gd|") + String(gids[i]), 1);
+				}
+			}
+		}
+	} else if (section == String("account_storehouse")) {
+		if (p_value.get_type() == Variant::DICTIONARY) {
+			Dictionary st = p_value;
+			if (st.has("entries") && st["entries"].get_type() == Variant::ARRAY) {
+				Array es = st["entries"];
+				for (int i = 0; i < es.size(); i++) {
+					if (es[i].get_type() != Variant::DICTIONARY) {
+						continue;
+					}
+					Dictionary ed = es[i];
+					String it = ed.has("item_type") ? String(ed["item_type"]) : String("item");
+					int64_t id = ed.has("id") ? snap_int_of(ed["id"]) : 0;
+					int64_t cnt = (it == String("equipment")) ? 1 : (ed.has("count") ? snap_int_of(ed["count"]) : 1);
+					snap_add(out, pre + it + String("|") + itos(id), cnt);
+				}
+			}
+		}
+	}
+	return out;
+}
+
+Dictionary snap_live_counts(const Dictionary &p_data) {
+	Dictionary out;
+	const char *acc_secs[2] = { "account_currencies", "account_storehouse" };
+	for (int i = 0; i < 2; i++) {
+		String sec = String(acc_secs[i]);
+		String key = String("a:") + sec;
+		out[key] = snap_count_section(key, p_data.has(sec) ? p_data[sec] : Variant());
+	}
+	const char *role_secs[5] = { "inventory", "equipment", "progression", "shenshou", "guardian" };
+	if (p_data.has("characters") && p_data["characters"].get_type() == Variant::ARRAY) {
+		Array slots = p_data["characters"];
+		for (int i = 0; i < slots.size(); i++) {
+			if (slots[i].get_type() != Variant::DICTIONARY) {
+				continue;
+			}
+			Dictionary sd = slots[i];
+			for (int r = 0; r < 5; r++) {
+				String sec = String(role_secs[r]);
+				String key = String("c") + itos(i) + String(":") + sec;
+				out[key] = snap_count_section(key, sd.has(sec) ? sd[sec] : Variant());
+			}
+		}
+	}
+	return out;
+}
+
+// 当前正在写入的 _save_data（LocalSaveManager 在 _write_save_file_v4 里持有）
+Dictionary snap_current_save_data() {
+	Dictionary empty;
+	Engine *eng = Engine::get_singleton();
+	if (eng == nullptr) {
+		return empty;
+	}
+	SceneTree *tree = Object::cast_to<SceneTree>(eng->get_main_loop());
+	if (tree == nullptr) {
+		return empty;
+	}
+	Node *root = tree->get_root();
+	if (root == nullptr) {
+		return empty;
+	}
+	Node *lsm = root->get_node_or_null(NodePath("LocalSaveManager"));
+	if (lsm == nullptr) {
+		return empty;
+	}
+	Variant v = lsm->get("_save_data");
+	if (v.get_type() != Variant::DICTIONARY) {
+		return empty;
+	}
+	Dictionary d = v;
+	if (d.is_empty()) {
+		return empty;
+	}
+	return d;
+}
+
+String snap_payload_of(const Dictionary &p_live) {
+	Dictionary wrap;
+	wrap["t"] = p_live;
+	return JSON::stringify(wrap);
+}
+
 String snap_status_json() {
 	const SnapState &s = snap_state();
 	String out = String("{\"ok\":1");
@@ -212,21 +427,17 @@ String snap_status_json() {
 	return out;
 }
 
-// snap_open：校验 seal 的 hex 与 (bind, payload) 的重算值
+// snap_open（0x3928C89）：先校验 seal 的 HMAC，再把 payload 里的计数表与脚本传来的
+// live 逐键比对。n>0 会被 快照拒读/快照处置 判成 diff，所以口径必须与官方一致：
+// 快照与存档缺键都按 0 计，只有真的不等才算一行 diff。
 String snap_open(const Dictionary &p_req) {
 	String seal;
 	String bind;
-	if (p_req.has("seal")) {
-		Variant v = p_req["seal"];
-		if (v.get_type() == Variant::STRING) {
-			seal = v;
-		}
+	if (p_req.has("seal") && p_req["seal"].get_type() == Variant::STRING) {
+		seal = p_req["seal"];
 	}
-	if (p_req.has("bind")) {
-		Variant v = p_req["bind"];
-		if (v.get_type() == Variant::STRING) {
-			bind = v;
-		}
+	if (p_req.has("bind") && p_req["bind"].get_type() == Variant::STRING) {
+		bind = p_req["bind"];
 	}
 	String hex;
 	String payload;
@@ -240,8 +451,73 @@ String snap_open(const Dictionary &p_req) {
 		snap_state().last_err = "bad";
 		return String(kRpcBad);
 	}
-	snap_state().opened++;
-	return String(kRpcOk);
+
+	Dictionary snap_t;
+	Variant parsed = JSON::parse_string(payload);
+	if (parsed.get_type() == Variant::DICTIONARY) {
+		Dictionary pd = parsed;
+		if (pd.has("t") && pd["t"].get_type() == Variant::DICTIONARY) {
+			snap_t = pd["t"];
+		}
+	}
+	Dictionary live;
+	if (p_req.has("live") && p_req["live"].get_type() == Variant::DICTIONARY) {
+		live = p_req["live"];
+	}
+
+	Array diff;
+	int64_t n = 0;
+	Array all_keys = snap_t.keys();
+	Array lkeys = live.keys();
+	for (int i = 0; i < lkeys.size(); i++) {
+		if (!snap_t.has(lkeys[i])) {
+			all_keys.push_back(lkeys[i]);
+		}
+	}
+	for (int i = 0; i < all_keys.size(); i++) {
+		Variant sk = all_keys[i];
+		Dictionary a;
+		Dictionary b;
+		if (snap_t.has(sk) && snap_t[sk].get_type() == Variant::DICTIONARY) {
+			a = snap_t[sk];
+		}
+		if (live.has(sk) && live[sk].get_type() == Variant::DICTIONARY) {
+			b = live[sk];
+		}
+		Array all_sub = a.keys();
+		Array bsubs = b.keys();
+		for (int x = 0; x < bsubs.size(); x++) {
+			if (!a.has(bsubs[x])) {
+				all_sub.push_back(bsubs[x]);
+			}
+		}
+		for (int x = 0; x < all_sub.size(); x++) {
+			Variant k = all_sub[x];
+			int64_t av = a.has(k) ? snap_int_of(a[k]) : 0;
+			int64_t bv = b.has(k) ? snap_int_of(b[k]) : 0;
+			if (av != bv) {
+				Array row;
+				row.push_back(String(k));
+				row.push_back(av);
+				row.push_back(bv);
+				diff.push_back(row);
+				n++;
+			}
+		}
+	}
+
+	if (n > 0) {
+		snap_state().open_diff++;
+	} else {
+		snap_state().opened++;
+	}
+	snap_state().last_err = String();
+	String out = String("{\"ok\":1,\"n\":") + itos(n) + String(",\"secs\":") + itos((int64_t)snap_t.size());
+	if (n > 0) {
+		out += String(",\"diff\":") + JSON::stringify(diff);
+	}
+	out += String("}");
+	return out;
 }
 
 // snap_rebind：沿用旧 seal 的 payload，按新 bind 重算 hex（换代）
@@ -272,29 +548,46 @@ String snap_rebind(const Dictionary &p_req) {
 			",\"seal\":\"" + new_seal.json_escape() + "\"}";
 }
 
-// snap_seal：需要一个 payload 才能封存；原版由 0x392C270 从引擎内部经济段自行生成，
-// 这里没有等价数据源，因此只在入参显式带来 payload 时封存，否则如实返回拒绝。
+// snap_seal：官方由 0x392C270 从引擎内部经济段现场生成 payload，脚本只传 bind。
+// 因此无 payload 时必须自己从 LocalSaveManager 的 _save_data 算真实计数，
+// 不能返回 nosnap —— 否则 header 里永远没有 ledger_snap，而水位记录里已有
+// snap_g，读档会被 读档核对() 判成 missing（=「存档与封存的记录对不上」）。
 String snap_seal(const Dictionary &p_req) {
 	String bind;
-	String payload;
-	if (p_req.has("bind")) {
-		Variant v = p_req["bind"];
-		if (v.get_type() == Variant::STRING) {
-			bind = v;
-		}
+	if (p_req.has("bind") && p_req["bind"].get_type() == Variant::STRING) {
+		bind = p_req["bind"];
 	}
-	if (p_req.has("payload")) {
-		Variant v = p_req["payload"];
-		if (v.get_type() == Variant::STRING) {
-			payload = v;
-		}
+	if (bind.is_empty()) {
+		snap_state().last_err = "nobind";
+		return String("{\"ok\":0,\"err\":\"nobind\"}");
+	}
+	// 测试入侵位：原版拒签并回报 b（脚本 账本快照.gd 的 测试入侵位 会带 test_block）
+	int64_t test_block = 0;
+	if (p_req.has("test_block")) {
+		test_block = snap_int_of(p_req["test_block"]);
+	}
+	if (test_block != 0) {
+		snap_state().refused++;
+		snap_state().last_err = "blocked";
+		return String("{\"ok\":0,\"err\":\"blocked\",\"b\":") + itos(test_block) + String("}");
+	}
+	String payload;
+	if (p_req.has("payload") && p_req["payload"].get_type() == Variant::STRING) {
+		payload = p_req["payload"];
 	}
 	if (payload.is_empty()) {
-		snap_state().last_err = "nosnap";
-		return String("{\"ok\":0,\"err\":\"nosnap\"}");
+		Dictionary data = snap_current_save_data();
+		if (data.is_empty()) {
+			// 不在保存流程内（或 LocalSaveManager 未就绪）：不伪造空快照，
+			// 空 payload 会让官方比对出全量 diff 从而封印账本。
+			snap_state().last_err = "nosnap";
+			return String("{\"ok\":0,\"err\":\"nosnap\"}");
+		}
+		payload = snap_payload_of(snap_live_counts(data));
 	}
 	String seal = snap_build_seal(bind, payload);
 	snap_state().sealed++;
+	snap_state().last_err = String();
 	return String("{\"ok\":1,\"n\":") + itos(snap_payload_sections(payload)) +
 			",\"seal\":\"" + seal.json_escape() + "\"}";
 }
@@ -368,6 +661,43 @@ String XiewaCore::core_rpc(const String &envelope) {
 		if (fn == String("snap_seal")) {
 			// 0x3928FA4
 			return snap_seal(d);
+		}
+		return String(kRpcFnFail);
+	}
+
+	// ---- ledger_*：经济账本接口 ----
+	// 脚本 经济账本.gd:可用() 要求 ledger_stats 回 ok=1，否则 LEDGER 不可用，
+	// 而 账本快照.gd:可用() 又要求 LEDGER 可用 —— 缺这一路会导致快照整体停用、
+	// header 永不写 ledger_snap，读档被 读档核对() 判成 missing。
+	// 这里按观察模式实现：不回 diff、不回 flags，避免误判与误封。
+	if (fn.begins_with("ledger_")) {
+		if (fn == String("ledger_stats")) {
+			return String("{\"ok\":1}");
+		}
+		if (fn == String("ledger_reset") || fn == String("ledger_load")) {
+			return String(kRpcOk);
+		}
+		if (fn == String("ledger_check")) {
+			// 不能回 n>0：脚本会把每一行写进 记事件，并且 对齐段() 会据此判不符
+			return String("{\"ok\":1,\"n\":0}");
+		}
+		if (fn == String("ledger_apply") || fn == String("ledger_ev_end") || fn == String("ledger_flow")) {
+			// flags 必须为空数组：非空会被 记事件("账本标记"/"账本语义不符")
+			return String("{\"ok\":1,\"flags\":[]}");
+		}
+		if (fn == String("ledger_ev_begin")) {
+			// e 回空串，_交原生() 会因 e 为空直接返回 []，不产生后续语义校验
+			return String("{\"ok\":1,\"e\":\"\"}");
+		}
+		if (fn == String("ledger_pity")) {
+			// r 非 0 即视为校验通过（脚本只在 r==0 时报保底不符）
+			return String("{\"ok\":1,\"r\":1}");
+		}
+		if (fn == String("ledger_drop_issue")) {
+			return String("{\"ok\":1,\"t\":\"\"}");
+		}
+		if (fn == String("ledger_drop_claim")) {
+			return String("{\"ok\":1,\"r\":-1}");
 		}
 		return String(kRpcFnFail);
 	}
