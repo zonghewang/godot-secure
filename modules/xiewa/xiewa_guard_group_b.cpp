@@ -42,16 +42,23 @@ uint64_t g_first_tick = 0;
 	0x70, 0x94, 0x77, 0x0D, 0x4E, 0x87, 0xE3, 0x54,
 };
 
-// 原版 XiewaPai.exe-gf 的第二代真实熵（2026-11-17 离线复算 + 实测验证）：
-//   种子 = sha256(exe 文件 .text 段原始字节)            // 0x38F1230 sha256_final → 0xb0(%rsp)
-//   D    = K2(种子, "xw-bind")                          // 0x38F0EBE  KDF(0x20, tag 0x51F6618, → 0x558A7D0)
-//   熵   = K2(seed32(D), "xiewa-dpapi2")                // 0x38F1AF6  KDF(0x20, tag 0x51F66D3, → 0x50(%rsp))
-//   K2(d,t) = SHA256( ((d‖0^32) ⊕ saltB) ‖ SHA256( ((d‖0^32) ⊕ saltA) ‖ t ) )
-//   saltA = "6666666666666666"(0x51F64B0)  saltB = "\\\\\\\\\\\\\\\\(0x51F64C0)
-// 用它对 Diao 的 profile.cfg（原版 ombrel DPAPI 两块）解封成功，得到 32 B 存档密钥。
-// [2026-11-19 对齐官方] 该常量已不再参与任何读写路径（官方 0x38F1B40 只认 ks），
-// 仅保留作历史取值记录，防止被误当成官方熵再次接回去。
-[[maybe_unused]] const uint8_t kEntropyOrigGen2[32] = {
+// 官方第二代「用户段」DPAPI 熵真值 =
+//   2c740f131381cbfbafbe8306c6ca29353d209d97269deff43b08d6716543b325
+//   来源：K2(seed32(K2(sha256(exe .text 原始字节), "xw-bind")), "xiewa-dpapi2")
+//         K2(d,t) = SHA256( ((d‖0^32) ⊕ saltB) ‖ SHA256( ((d‖0^32) ⊕ saltA) ‖ t ) )
+//         saltA = "6666666666666666"(0x51F64B0)  saltB = 16*0x5C(0x51F64C0)
+//   —— 2026-11-17 用原版 derive2 复算、并用它解开原版 profile.cfg 的 ombrel 两块。
+//
+// [2026-11-19 现场实证 · 决定性] 官方自己写出的水位记录
+//     %LOCALAPPDATA%\Ombrel\cache\aa329b93408291a9.idx（6092 B）
+//   结构 = XWD3 + u32(3042) + seg1(3042) + seg2(3042)，
+//   seg1 用本常量解封成功 → 2804 B 合法 var_to_bytes({b,m,v}) 明文
+//        （首部 1b000000 03000000 04000000 01000000 62000000 1d000000 900a0000 …）；
+//   同一个 seg1 用上一版的 ks(393d8cb8…) 解封失败。
+// ⇒ 官方 wrap2 / unwrap2 的 user 段熵就是本常量。
+//   写入必须用它，否则官方读我方写的 XWD3 时 user 段失败、落到 machine 段、
+//   全空，最终报「这个档案不属于本机或当前 Windows 用户」(T4)。
+const uint8_t kEntropyUser2[32] = {
 	0x2C, 0x74, 0x0F, 0x13, 0x13, 0x81, 0xCB, 0xFB,
 	0xAF, 0xBE, 0x83, 0x06, 0xC6, 0xCA, 0x29, 0x35,
 	0x3D, 0x20, 0x9D, 0x97, 0x26, 0x9D, 0xEF, 0xF4,
@@ -60,7 +67,7 @@ uint64_t g_first_tick = 0;
 
 const char *kTagDpapi2 = "xiewa-dpapi2";
 const char *kTagDerive = "xw2-derive";
-const char *kTagOmbrel = "ombrel";
+[[maybe_unused]] const char *kTagOmbrel = "ombrel";
 
 // gate()：返回 true 表示本次调用应被拦断（调用方直接返回空值）
 bool gate() {
@@ -80,25 +87,20 @@ bool gate() {
 }
 
 // -----------------------------------------------------------------------------
-//  第二代 DPAPI 熵（0x38F1970 第 3 步逐指令实证，2026-11-18 二次核对）
+//  旧版熵派生 —— [2026-11-19 降级] 仅用于解开本模块旧版写出的数据，不再用于写入
 //
-//    官方不用任何静态常量作熵，而是现场从四张 .rdata 表摊平出一个 32 B 矩阵：
-//      T1 @ 0x51F6500（32 B）  T2 @ 0x51F6520（32 B）
-//      T3 @ 0x51F6540（32 B）  T4 @ 0x558A7D0（32 B）
+//  上一版据 0x38F1970 反汇编认为「官方现场从四张 .rdata 表摊平 32 B 矩阵、再
+//  HMAC_SHA256(mat, "xiewa-dpapi2") 得熵」，实算：
+//      mat = c97253c28ceb3568880aa9a872330f4dfcfb22cf990c630feced8038f939a4be
+//      ks  = 393d8cb8b2cd67b4a0baf23690aa628c82fa1768f2515355d14b8ee6837fb801
+//  2026-11-19 现场实证推翻了这个结论：官方 seg1 用 ks 解不开，用 kEntropyUser2 能解开。
+//  ⇒ ks 是本模块自己算出来的值，官方并不拿它当熵；保留这套派生只为兼容旧档。
 //      i = 0 .. 31：
 //        v  = (T1[(9 + 11i) & 31] * 0x2D + (0x5A + 23i)) & 0xFF
 //        v ^= T2[(3 + 5i) & 31]
 //        v ^= T3[(0x0B + 7i) & 31]
 //        v ^= T4[i]
-//        mat[i] = v
-//      实算 mat = c97253c28ceb3568880aa9a872330f4dfcfb22cf990c630feced8038f939a4be
-//
-//    然后 0x38F12E0 是一条标准 HMAC：
-//      HMAC_SHA256(key = mat32, msg = "xiewa-dpapi2"(12 B)) → [rsp+0x20]
-//      实算 ks = 393d8cb8b2cd67b4a0baf23690aa628c82fa1768f2515355d14b8ee6837fb801
-//
-//    ks 只被当作 CryptProtectData / CryptUnprotectData 的 pOptionalEntropy，
-//   ** 不做任何明文异或 **（上一版把它当 XOR 流用，是彻底错的）。
+//  ks 只被当作 CryptProtectData 的 pOptionalEntropy，** 不做任何明文异或 **。
 // -----------------------------------------------------------------------------
 const uint8_t kXw2T1[32] = {
 	0x94, 0x77, 0x50, 0x29, 0xAE, 0xFB, 0xF8, 0x7D,
@@ -289,21 +291,21 @@ PackedByteArray XiewaGuard::device_wrap2(const PackedByteArray &in) {
 		return out;
 	}
 #ifdef WINDOWS_ENABLED
-	// 官方 0x38F1970 全流程（2026-11-18 二次逐指令核对）：
-	//   ① gate：call 0x38F7B60(bridge_check，参数 2) → and eax,0x63 → 非 0 返回空
-	//   ② 四表摊平得 mat32（见 xw2_entropy32 注释）
-	//   ③ HMAC_SHA256(mat32, "xiewa-dpapi2") → ks
-	//   ④ CryptProtectData(in, L"ombrel", entropy = ks, NULL, NULL, UI_FORBIDDEN)
-	// 全程没有任何明文异或，也没有自造的字节头。
+	// 官方 0x38F1970 的 DPAPI 语义：
+	//   CryptProtectData(in, L"ombrel", entropy = kEntropyUser2, NULL, NULL, UI_FORBIDDEN)
+	// 全程没有任何明文异或，也没有自造的字节头；XWD3 容器由脚本层拼。
+	//
+	// [2026-11-19 关键修正] 熵必须是官方真值 kEntropyUser2，不能再用 xw2_entropy32(ks)。
+	//   用 ks 写出的 seg1 官方解不开，会落到 machine 段、全空，官方直接判 T4。
+	//   这一处就是「自编译版跑过一次后官方版打不开存档」的根因。
 	Vector<uint8_t> plain;
 	plain.resize(in.size());
 	if (in.size() > 0) {
 		memcpy(plain.ptrw(), in.ptr(), (size_t)in.size());
 	}
-	uint8_t ks[32];
-	xw2_entropy32(ks);
 	Vector<uint8_t> cipher;
-	if (!dpapi_protect_entropy2(plain, ks, cipher)) {
+	if (!dpapi_protect_entropy2(plain, kEntropyUser2, cipher)) {
+		print_line(vformat("[xiewa] wrap2 FAIL in=%d", in.size()));
 		return out;
 	}
 	out.resize((int)cipher.size());
@@ -318,27 +320,32 @@ PackedByteArray XiewaGuard::device_unwrap2(const PackedByteArray &in) {
 		return out;
 	}
 #ifdef WINDOWS_ENABLED
-	// 官方 0x38F1B40 与 wrap2 完全对称：同 gate、同四表 mat32、同 HMAC，
-	// 唯一差别是 `xor r9d,r9d` → mode = 0 → CryptUnprotectData。
-	// [2026-11-19 对齐官方] 删掉上一版的 kEntropyOrigGen2 兜底：官方 0x38F1B40
-	// 只认 ks 一种熵，没有任何 legacy 兜底，留着它会让本模块与官方行为不一致。
-	// 也不再做任何 keystream 反异或。
+	// 官方 0x38F1B40 与 wrap2 完全对称：同 gate、同熵、CryptUnprotectData。
+	// [2026-11-19 关键修正] 主用官方真熵 kEntropyUser2；
+	//   旧的 xw2_entropy32(ks) 降级为「只读兜底」，专门用来解开本模块旧版写出的 seg1，
+	//   避免用户机器上的老数据因为换熵而直接失效。
+	// 读路径多一档兜底不会让官方数据被误判：官方 seg1 第一档就能解开。
 	if (in.size() == 0) {
 		return out;
 	}
 	Vector<uint8_t> cipher;
 	cipher.resize(in.size());
 	memcpy(cipher.ptrw(), in.ptr(), (size_t)in.size());
-	uint8_t ks[32];
-	xw2_entropy32(ks);
 	Vector<uint8_t> plain;
-	if (!dpapi_unprotect_entropy(cipher, ks, plain)) {
-		print_line(vformat("[xiewa] unwrap2 FAIL in=%d ks=%s", in.size(), util::to_hex(ks, 8)));
-		return out;
+	if (dpapi_unprotect_entropy(cipher, kEntropyUser2, plain)) {
+		print_line(vformat("[xiewa] unwrap2 OK(official) in=%d -> %d", in.size(), plain.size()));
+	} else {
+		uint8_t ks[32];
+		xw2_entropy32(ks);
+		if (!dpapi_unprotect_entropy(cipher, ks, plain)) {
+			print_line(vformat("[xiewa] unwrap2 FAIL in=%d (official+legacy)", in.size()));
+			return out;
+		}
+		print_line(vformat("[xiewa] unwrap2 OK(legacy ks=%s) in=%d -> %d",
+				util::to_hex(ks, 8), in.size(), plain.size()));
 	}
 	out.resize((int)plain.size());
 	memcpy(out.ptrw(), plain.ptr(), (size_t)plain.size());
-	print_line(vformat("[xiewa] unwrap2 OK in=%d ks=%s -> %d", in.size(), util::to_hex(ks, 8), out.size()));
 #endif
 	return out;
 }
@@ -350,9 +357,10 @@ PackedByteArray XiewaGuard::device_unwrap2(const PackedByteArray &in) {
 //   **没有任何版本字节、没有 16 字节标签、没有外壳**：输出就是一段纯 DPAPI blob，
 //   官方 device_unwrap_m2 也是把整个输入直接丢给 CryptUnprotectData。
 //   上一版加的 [02]+16B tag 是本模块自造的，官方根本不解析，会当成坏 blob。
-//   限制：0x38F1D70 的密钥来自运行时枚举的 provider 名，离线不可复刻；
-//   本模块以 ks 作熵，因此「格式完全对齐、密钥来源不同」。
-//   这只影响 machine 段本身（user 段正常时永不启用），不破坏 user 段的互通。
+//   限制：0x38F1D70 的密钥来自运行时枚举的 CSP provider 名，静态不可复刻；
+//   本模块用 kEntropyUser2 作熵，因此「外层格式完全对齐、密钥来源不同」。
+//   影响面：这个 machine 段只在 user 段解不开时才会被官方读取；
+//   user 段改用 kEntropyUser2 后官方能正常解开，根本不会碰这一段，互通不受影响。
 PackedByteArray XiewaGuard::device_wrap_m2(const PackedByteArray &in) {
 	PackedByteArray out;
 	if (gate()) {
@@ -365,10 +373,8 @@ PackedByteArray XiewaGuard::device_wrap_m2(const PackedByteArray &in) {
 	Vector<uint8_t> plain;
 	plain.resize(in.size());
 	memcpy(plain.ptrw(), in.ptr(), (size_t)in.size());
-	uint8_t ks[32];
-	xw2_entropy32(ks);
 	Vector<uint8_t> cipher;
-	if (!dpapi_protect_machine_entropy(plain, ks, cipher)) {
+	if (!dpapi_protect_machine_entropy(plain, kEntropyUser2, cipher)) {
 		print_line(vformat("[xiewa] wrap_m2 FAIL in=%d", in.size()));
 		return out;
 	}
@@ -393,16 +399,21 @@ PackedByteArray XiewaGuard::device_unwrap_m2(const PackedByteArray &in) {
 	Vector<uint8_t> cipher;
 	cipher.resize(in.size());
 	memcpy(cipher.ptrw(), in.ptr(), (size_t)in.size());
-	uint8_t ks[32];
-	xw2_entropy32(ks);
 	Vector<uint8_t> plain;
-	if (!dpapi_unprotect_machine_entropy(cipher, ks, plain)) {
-		print_line(vformat("[xiewa] unwrap_m2 FAIL in=%d", in.size()));
-		return out;
+	if (dpapi_unprotect_machine_entropy(cipher, kEntropyUser2, plain)) {
+		print_line(vformat("[xiewa] unwrap_m2 OK(official) in=%d -> %d", in.size(), plain.size()));
+	} else {
+		uint8_t ks[32];
+		xw2_entropy32(ks);
+		if (!dpapi_unprotect_machine_entropy(cipher, ks, plain)) {
+			print_line(vformat("[xiewa] unwrap_m2 FAIL in=%d (official+legacy)", in.size()));
+			return out;
+		}
+		print_line(vformat("[xiewa] unwrap_m2 OK(legacy ks=%s) in=%d -> %d",
+				util::to_hex(ks, 8), in.size(), plain.size()));
 	}
 	out.resize((int)plain.size());
 	memcpy(out.ptrw(), plain.ptr(), (size_t)plain.size());
-	print_line(vformat("[xiewa] unwrap_m2 OK in=%d -> %d", in.size(), out.size()));
 #endif
 	return out;
 }
