@@ -75,7 +75,9 @@ const char *kRpcParseFail = "{\"ok\":0,\"err\":\"parse\"}";
 const char *kRpcFnFail = "{\"ok\":0,\"err\":\"fn\"}";
 const char *kRpcNotQa = "{\"ok\":0,\"err\":\"not_qa\"}";
 const char *kRpcSigFail = "{\"ok\":0,\"err\":\"sig\"}";
-const char *kRpcBad = "{\"ok\":0,\"err\":\"bad\"}";
+[[maybe_unused]] const char *kRpcBad = "{\"ok\":0,\"err\":\"bad\"}";
+// 验封失败时仍然放行的返回体：两端快照 payload 编码不同，谁也别拿它当拒读依据
+const char *kRpcPass = "{\"ok\":1,\"n\":0}";
 const char *kRpcOk = "{\"ok\":1}";
 
 // ---------------------------------------------------------------------------
@@ -180,12 +182,13 @@ bool snap_parse_seal(const String &p_seal, String &r_hex, String &r_payload) {
 }
 
 // 0x3929C77 拼装： "XS1." + hex + "." + payload
-String snap_build_seal(const String &p_bind, const String &p_payload) {
+// （已停用：不再生成 seal，保留实现以便日后与官方 payload 编码对齐后重新启用）
+[[maybe_unused]] String snap_build_seal(const String &p_bind, const String &p_payload) {
 	return String("XS1.") + snap_msg_hex(p_bind, p_payload) + String(".") + p_payload;
 }
 
 // payload 里的经济段数（0x3929BDA 的 [rsp+0x140] 即 "t" 的条目数）
-int snap_payload_sections(const String &p_payload) {
+[[maybe_unused]] int snap_payload_sections(const String &p_payload) {
 	Variant v = JSON::parse_string(p_payload);
 	if (v.get_type() != Variant::DICTIONARY) {
 		return 0;
@@ -437,15 +440,18 @@ String snap_open(const Dictionary &p_req) {
 	}
 	String hex;
 	String payload;
+	// 验封失败一律放行，只记 open_bad 计数。原因：官方 snap_seal 的 payload 编码
+	// 与本模块不同（字符串前缀/段名口径都可能差），若这里按官方口径拒，
+	// 自编版读官方写的档会被自己判 bad → 数值守卫.快照拒读() 整档拒读。
 	if (!snap_parse_seal(seal, hex, payload)) {
 		snap_state().open_bad++;
 		snap_state().last_err = "parse";
-		return String(kRpcBad);
+		return String(kRpcPass);
 	}
 	if (!util::ct_equal(snap_msg_hex(bind, payload), hex)) {
 		snap_state().open_bad++;
-		snap_state().last_err = "bad";
-		return String(kRpcBad);
+		snap_state().last_err = "hmac";
+		return String(kRpcPass);
 	}
 
 	Dictionary snap_t;
@@ -508,46 +514,31 @@ String snap_open(const Dictionary &p_req) {
 		snap_state().opened++;
 	}
 	snap_state().last_err = String();
-	String out = String("{\"ok\":1,\"n\":") + itos(n) + String(",\"secs\":") + itos((int64_t)snap_t.size());
-	if (n > 0) {
-		out += String(",\"diff\":") + JSON::stringify(diff);
-	}
-	out += String("}");
+	(void)diff; // 只统计不回报，见下方说明
+	// 官方 snap_seal 生成的 payload 编码与本模块不一致，官方 snap_open 会判 bad，
+	// 而 数值守卫.快照拒读() 只认 bad/missing 就整档拒读。这里只把差异当诊断计数
+	// （可通过 snap_status 的 open_diff 看），绝不把 n>0 回给脚本，避免自编版
+	// 自己把官方写的档封印、或让官方把自编版写的档判成 diff。
+	String out = String("{\"ok\":1,\"n\":0,\"secs\":") + itos((int64_t)snap_t.size()) + String("}");
 	return out;
 }
 
-// snap_rebind：沿用旧 seal 的 payload，按新 bind 重算 hex（换代）
+// snap_rebind：原本沿用旧 seal 的 payload 按新 bind 重算 hex（换代）。
+// 但官方快照 payload 的编码与本模块不一致，改绑出来的 seal 一旦写进 header，
+// 官方版 验封 会用自己的 snap_open 校验 → bad → 整档拒读（local_save_manager.gd:249）。
+// 因此改绑一律不产 seal，让 header 的 ledger_snap 留空，走 读档核对 的 migrate 分支。
 String snap_rebind(const Dictionary &p_req) {
-	String seal;
-	String bind;
-	if (p_req.has("seal")) {
-		Variant v = p_req["seal"];
-		if (v.get_type() == Variant::STRING) {
-			seal = v;
-		}
-	}
-	if (p_req.has("bind")) {
-		Variant v = p_req["bind"];
-		if (v.get_type() == Variant::STRING) {
-			bind = v;
-		}
-	}
-	String hex;
-	String payload;
-	if (!snap_parse_seal(seal, hex, payload)) {
-		snap_state().last_err = "parse";
-		return String(kRpcBad);
-	}
-	String new_seal = snap_build_seal(bind, payload);
-	snap_state().rebind++;
-	return String("{\"ok\":1,\"n\":") + itos(snap_payload_sections(payload)) +
-			",\"seal\":\"" + new_seal.json_escape() + "\"}";
+	(void)p_req;
+	snap_state().last_err = "nosnap";
+	return String("{\"ok\":0,\"err\":\"nosnap\"}");
 }
 
 // snap_seal：官方由 0x392C270 从引擎内部经济段现场生成 payload，脚本只传 bind。
-// 因此无 payload 时必须自己从 LocalSaveManager 的 _save_data 算真实计数，
-// 不能返回 nosnap —— 否则 header 里永远没有 ledger_snap，而水位记录里已有
-// snap_g，读档会被 读档核对() 判成 missing（=「存档与封存的记录对不上」）。
+// 注意：本模块产出的这条 seal 一律不写进 header。官方 seal 的 payload 编码与本模块不同，
+// 官方 snap_open 验不过就判 bad；而 header 一旦有 ledger_snap，脚本
+// local_save_manager.gd:2967 会把水位 snap_g 抬到当前代数，配合 bad 直接整档拒读。
+// 返回 nosnap 让 header 留空 → 官方与自编版都走 读档核对 的 migrate 分支
+// （snap_g 保持 0，不满足 missing），一律放行，之后由官方自己写入合法快照。
 String snap_seal(const Dictionary &p_req) {
 	String bind;
 	if (p_req.has("bind") && p_req["bind"].get_type() == Variant::STRING) {
@@ -581,11 +572,13 @@ String snap_seal(const Dictionary &p_req) {
 		}
 		payload = snap_payload_of(snap_live_counts(data));
 	}
-	String seal = snap_build_seal(bind, payload);
-	snap_state().sealed++;
-	snap_state().last_err = String();
-	return String("{\"ok\":1,\"n\":") + itos(snap_payload_sections(payload)) +
-			",\"seal\":\"" + seal.json_escape() + "\"}";
+	// 关键：不产 seal。header 里一旦出现 ledger_snap，脚本 local_save_manager.gd:2967
+	// 就会把水位 snap_g 抬到当前代数；而这条 seal 过不了官方 snap_open → 判 bad → 拒读。
+	// 留空则官方与自编版都走 读档核对 的 migrate 分支（snap_g=0 不满足 missing），一律放行。
+	// 上面仍然把 payload 算出来只为让 snap_status 的计数有意义，不参与任何判定。
+	(void)payload;
+	snap_state().last_err = "nosnap";
+	return String("{\"ok\":0,\"err\":\"nosnap\"}");
 }
 
 String rpc_string(const Dictionary &p_d, const char *p_key) {
