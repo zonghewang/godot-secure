@@ -1,16 +1,13 @@
 // =============================================================================
-//  xiewa_guard2d.h —— 与 xiewa_guard2d.cpp 配套的**可编译**头文件
+//  xiewa_guard2d.h —— 配套 xiewa_guard2d.cpp 的接口声明
 //
-//  ★ 本头是按 .cpp 的实际用法逐字段对齐写成的（旧"声明稿"已移入 _pseudo_backup）。
-//    - 结构体字段全部按 C++ 标准成员声明，不再模拟原程序的裸偏移互读；
-//    - 类型用引擎真实类型（String / Vector / Dictionary），无占位类型；
-//    - 接口签名与 .cpp 的函数定义逐条一致。
+//  这一对文件只干一件事：读当前进程的内存镜像，把 .text 还原成磁盘原样，
+//  算 SHA-256 与基线比对（详见 .cpp 头部说明）。
 //
-//  对应原程序：0x3E09xxx–0x3E1495A 这一整块 PE 自校验代码
-//    CurrentProcessReader 构造 0x3E0C910 / read 0x3E0EF00 / image_base 0x3E0F050
-//    verify 0x3E0C980 / read_headers 0x3E0D3C0 / read_relocations 0x3E0D900
-//    process_chunk 0x3E0E4C0 / read_embedded_stream 0x3E0E340 / to_hex 0x3E0ED70
-//    meta_from_dictionary 0x38EBB10 / script_integrity 0x3E13260
+//  两个类：
+//    CurrentProcessReader —— 拿当前进程的模块基址与镜像数据
+//    ImageReader          —— 读 PE 头、读重定位表、逐块还原并校验
+//  两者都只在模块内部使用，没有注册进 ClassDB。
 // =============================================================================
 
 #pragma once

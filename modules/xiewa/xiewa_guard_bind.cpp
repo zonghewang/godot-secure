@@ -1,25 +1,15 @@
 // =============================================================================
-//  xiewa_guard_bind.cpp —— XiewaGuard::_bind_methods() 的 54 条真实绑定
+//  xiewa_guard_bind.cpp —— 把 XiewaGuard 的 54 个方法一次性绑进 ClassDB
 //
-//  用法：把本文件的函数体替换进 xiewa_guard.cpp 里的 XiewaGuard::_bind_methods()，
-//        或直接把本文件当独立编译单元（SCsub 已 add_source_files "*.cpp"，会自动编）。
+//  三个组的绑定都写在这里（组A 21 / 组B 12 / 组C 21），一次 _bind_methods 绑完。
+//  本文件是独立编译单元，SCsub 的 "*.cpp" 会自动收进来。
 //
-//  对应关系（原程序）：
-//    0x340C600  = XiewaGuard::_bind_methods   → 组A 21 条 + 尾部调 0x38F2A50 / 0x3910350
-//    0x38F2A50  = 组B 12 条（在同一 _bind_methods 尾部被 call）
-//    0x3910350  = 组C 21 条（同上）
-//    0xCCE1A0   = bind_methodfi 本体（bind_method / bind_static_method 共用），三批共用
-//  因此 54 条全部属于 XiewaGuard 一个类，一次性绑完即可。
-//
-//  ★ 2026-11-16：这 54 条改为 bind_static_method（静态绑定）。
-//    原因：脚本侧是「XiewaGuard.方法()」的静态调用，实例绑定会触发
-//    "Method is not static."（core/core_bind.cpp:1724 ClassDB::class_call_static）。
-//    这些实现的 C++ 侧只碰文件级全局量，改成 static 成员函数不改变行为。
-//
-//  ★ 方法名必须逐字符等于 .rdata 里的绑定串（下面每条注释都标了源串地址），
-//    否则 pck 里脚本的 has_method("…") 会静默失配。
-//  ★ 参数名只是编辑器/文档展示用，不影响调用；这里按语义起名。
-//  ★ 返回类型由 C++ 签名自动登记，不需要额外声明。
+//  两条必须守住的规则：
+//    1. 全部用 bind_static_method。脚本侧调用形如 XiewaGuard.方法()，
+//       用实例绑定会报 "Method is not static."。这些实现只碰文件级全局量，
+//       改成 static 不改变行为。
+//    2. 方法名必须与 pck 里脚本写的字面量逐字符一致，否则 has_method() 会静默失配。
+//       参数名只用于编辑器展示，返回类型由 C++ 签名自动登记。
 // =============================================================================
 
 #include "xiewa_guard.h"
