@@ -199,6 +199,16 @@ public:
     // 名串 0x51F65A4，实现 0x38F2000（292）
     // [修正 2026-11-16] exe 类型表：argc=1，[返回=PACKED_BYTE_ARRAY, 参数=PACKED_BYTE_ARRAY]
     static PackedByteArray device_unwrap_m2(const PackedByteArray &in);
+    // —— 水位自愈（模块自用，不绑定给脚本，脚本侧看不到这个方法）。
+    // 水位信封 {b: PBA, m: PBA(32), v: INT 2} 里，脚本真正会读的只有 b 内的 snap_g。
+    // 官方版写档会签发 header 封存记录并把 snap_g 抬到当前代数；本模块不签发封存记录，
+    // header 那条被清掉、snap_g 的高值却留在水位里，于是 账本快照.gd:读档核对 判
+    // 「没有封存记录 + snap_g > 0」= missing ⇒ 拒读（自编版和官方版报同一句话，
+    // 因为判定全在脚本层）。这里在读写水位的两个方向上把 snap_g 归零并用同一套
+    // sign2 重算 m，维持「header 没有封存记录时 snap_g 必定为 0」这个不变量。
+    // 安全边界：结构必须精确匹配 {b, m(32), v=2}，且现有 m 能用 sign2 复算命中，
+    // 否则原样返回，一个字节都不动。
+    static PackedByteArray water_heal(const PackedByteArray &plain);
     // 名串 0x51F65B5，实现 0x38F2050（276）—— 时间窗 0x7D0 + 副本扫描 + "save5…" 标签判定
     // [修正 2026-11-17] 脚本侧实参顺序是 (label, key, body)：守护.sign2 →
     //   _native.sign2(label, key, body)，第 2 参是密钥、第 3 参才是待签数据。

@@ -19,6 +19,8 @@
 #include "core/variant/array.h"
 #include "core/variant/dictionary.h"
 
+#include <cstring>
+
 #ifdef WINDOWS_ENABLED
 #include <windows.h>
 #include <wincrypt.h>
@@ -299,10 +301,11 @@ PackedByteArray XiewaGuard::device_wrap2(const PackedByteArray &in) {
 	// [2026-11-19 关键修正] 熵必须是官方真值 kEntropyUser2，不能再用 xw2_entropy32(ks)。
 	//   用 ks 写出的 seg1 官方解不开，会落到 machine 段、全空，官方直接判 T4。
 	//   这一处就是「自编译版跑过一次后官方版打不开存档」的根因。
+	PackedByteArray src = water_heal(in);   // 水位信封在这里把 snap_g 归零（其它数据原样返回）
 	Vector<uint8_t> plain;
-	plain.resize(in.size());
-	if (in.size() > 0) {
-		memcpy(plain.ptrw(), in.ptr(), (size_t)in.size());
+	plain.resize(src.size());
+	if (src.size() > 0) {
+		memcpy(plain.ptrw(), src.ptr(), (size_t)src.size());
 	}
 	Vector<uint8_t> cipher;
 	if (!dpapi_protect_entropy2(plain, kEntropyUser2, cipher)) {
@@ -345,8 +348,10 @@ PackedByteArray XiewaGuard::device_unwrap2(const PackedByteArray &in) {
 		XW_DEBUG_PRINT(vformat("[xiewa] unwrap2 OK(legacy ks=%s) in=%d -> %d",
 				util::to_hex(ks, 8), in.size(), plain.size()));
 	}
-	out.resize((int)plain.size());
-	memcpy(out.ptrw(), plain.ptr(), (size_t)plain.size());
+	PackedByteArray raw;
+	raw.resize((int)plain.size());
+	memcpy(raw.ptrw(), plain.ptr(), (size_t)plain.size());
+	out = water_heal(raw);   // 读档顺手自愈：snap_g 归零后脚本才不会判 missing
 #endif
 	return out;
 }
@@ -371,9 +376,10 @@ PackedByteArray XiewaGuard::device_wrap_m2(const PackedByteArray &in) {
 	if (in.size() == 0) {
 		return out;
 	}
+	PackedByteArray src = water_heal(in);   // 跟 user 段一致：machine 段也写归零后的明文
 	Vector<uint8_t> plain;
-	plain.resize(in.size());
-	memcpy(plain.ptrw(), in.ptr(), (size_t)in.size());
+	plain.resize(src.size());
+	memcpy(plain.ptrw(), src.ptr(), (size_t)src.size());
 	Vector<uint8_t> cipher;
 	if (!dpapi_protect_machine_entropy(plain, kEntropyUser2, cipher)) {
 		XW_DEBUG_PRINT(vformat("[xiewa] wrap_m2 FAIL in=%d", in.size()));
@@ -413,8 +419,10 @@ PackedByteArray XiewaGuard::device_unwrap_m2(const PackedByteArray &in) {
 		XW_DEBUG_PRINT(vformat("[xiewa] unwrap_m2 OK(legacy ks=%s) in=%d -> %d",
 				util::to_hex(ks, 8), in.size(), plain.size()));
 	}
-	out.resize((int)plain.size());
-	memcpy(out.ptrw(), plain.ptr(), (size_t)plain.size());
+	PackedByteArray raw;
+	raw.resize((int)plain.size());
+	memcpy(raw.ptrw(), plain.ptr(), (size_t)plain.size());
+	out = water_heal(raw);   // 走 machine 段解出来的水位同样自愈
 #endif
 	return out;
 }
@@ -721,6 +729,147 @@ String XiewaGuard::name2(const String &in, const String &suffix) {
 	CharString u8 = (s + tail).utf8();
 	util::sha256(u8.get_data(), (size_t)u8.length(), d);
 	return String("xw2-") + util::to_hex(d, 16).substr(0, 12);
+}
+
+// =============================================================================
+//  水位自愈 water_heal（模块内部用，没有绑定给脚本）
+//
+//  要解决的问题（全部发生在脚本层，所以自编版和官方版报同一句话）：
+//    1. 官方版写档：签发 header 里的 ledger_snap 封存记录，并把水位 snap_g 抬到当前代数
+//    2. 本模块写档：不签发封存记录 ⇒ header 那条被清掉，但 snap_g 的高值留在水位里
+//    3. 之后任何一端读档：账本快照.gd:读档核对 见到「没有封存记录 + snap_g > 0」
+//       ⇒ missing ⇒ 数值守卫.快照拒读 ⇒ 报「存档与游戏封存的记录对不上」
+//  修法：在读写水位明文的两端把 snap_g 归零，并用脚本同一个 sign2("mark","",b)
+//  重算 m，于是「header 没有封存记录时 snap_g 必定是 0」，读档永远走 migrate 放行。
+//
+//  只改 4 字节整数与 32 字节签名，明文总长度不变（不必重新序列化）。
+//  安全边界：结构必须精确等于 {b: PBA, m: PBA(32), v: INT 2} 且整段正好填满明文，
+//  并且现有 m 能用 sign2 复算命中；任何一项不符就原样返回，一个字节都不动。
+// =============================================================================
+PackedByteArray XiewaGuard::water_heal(const PackedByteArray &plain) {
+	const int n = plain.size();
+	if (n < 24) {
+		return plain;
+	}
+	const uint8_t *p = plain.ptr();
+	auto rd32 = [](const uint8_t *q) {
+		return (uint32_t)q[0] | ((uint32_t)q[1] << 8) | ((uint32_t)q[2] << 16) | ((uint32_t)q[3] << 24);
+	};
+	if (rd32(p) != 27 || rd32(p + 4) != 3) {   // Dictionary + 恰好三个键
+		return plain;
+	}
+
+	int off = 8;
+	int b_off = -1;
+	int b_len = 0;
+	int m_off = -1;
+	int m_len = 0;
+	int v_val = -1;
+	for (int k = 0; k < 3; k++) {
+		if (off + 8 > n || rd32(p + off) != 4) {   // 键必须是 String
+			return plain;
+		}
+		uint32_t klen = rd32(p + off + 4);
+		int koff = off + 8;
+		if (klen == 0 || klen > 64 || koff + (int)klen > n) {
+			return plain;
+		}
+		String key = String::utf8((const char *)(p + koff), (int)klen);
+		off = koff + (int)klen + ((4 - (int)(klen % 4)) % 4);   // 字符串按 4 字节对齐
+		if (off + 4 > n) {
+			return plain;
+		}
+		uint32_t hdr = rd32(p + off);
+		int type = (int)(hdr & 0xFF);
+		off += 4;
+		if (key == "b" || key == "m") {
+			if (type != 29) {   // PackedByteArray
+				return plain;
+			}
+			uint32_t ln = rd32(p + off);
+			off += 4;
+			if (off + (int)ln > n) {
+				return plain;
+			}
+			if (key == "b") {
+				b_off = off;
+				b_len = (int)ln;
+			} else {
+				m_off = off;
+				m_len = (int)ln;
+			}
+			off += (int)ln;
+		} else if (key == "v") {
+			if (type != 2) {   // int
+				return plain;
+			}
+			int ln = (hdr & (1u << 16)) ? 8 : 4;   // 带 64 位标志时是 8 字节
+			if (off + ln > n) {
+				return plain;
+			}
+			v_val = (int)rd32(p + off);
+			off += ln;
+		} else {
+			return plain;   // 出现别的键：不是水位信封
+		}
+	}
+	if (off != n || b_off < 0 || b_len <= 0 || m_off < 0 || m_len != 32 || v_val != 2) {
+		return plain;
+	}
+
+	// 在 b 里定位 snap_g：<String 头><长度 6><"snap_g"><2 字节补位><int 头><4 字节值>
+	static const uint8_t kSnapKey[14] = { 0x04, 0x00, 0x00, 0x00, 0x06, 0x00, 0x00, 0x00,
+		's', 'n', 'a', 'p', '_', 'g' };
+	int val_off = -1;
+	for (int i = 0; i + 24 <= b_len; i++) {
+		if (memcmp(p + b_off + i, kSnapKey, 14) != 0) {
+			continue;
+		}
+		if (p[b_off + i + 14] != 0 || p[b_off + i + 15] != 0) {
+			continue;
+		}
+		if (rd32(p + b_off + i + 16) != 2) {
+			continue;
+		}
+		val_off = b_off + i + 20;
+		break;
+	}
+	if (val_off < 0) {
+		return plain;
+	}
+	uint32_t cur = rd32(p + val_off);
+	if (cur == 0) {
+		return plain;   // 已经是 0，不动
+	}
+
+	// 先验证现有 m 就是 sign2("mark","",b)：能复算命中才动手
+	PackedByteArray body;
+	body.resize(b_len);
+	if (b_len > 0) {
+		memcpy(body.ptrw(), p + b_off, (size_t)b_len);
+	}
+	PackedByteArray mac_file;
+	mac_file.resize(32);
+	memcpy(mac_file.ptrw(), p + m_off, 32);
+	if (!verify2("mark", PackedByteArray(), body, mac_file)) {
+		return plain;
+	}
+
+	PackedByteArray healed = plain;
+	uint8_t *w = healed.ptrw();
+	for (int i = 0; i < 4; i++) {
+		w[val_off + i] = 0;
+	}
+	PackedByteArray body2;
+	body2.resize(b_len);
+	memcpy(body2.ptrw(), w + b_off, (size_t)b_len);
+	PackedByteArray mac2 = sign2("mark", PackedByteArray(), body2);
+	if (mac2.size() != 32) {
+		return plain;
+	}
+	memcpy(w + m_off, mac2.ptr(), 32);
+	XW_DEBUG_PRINT(vformat("[xiewa] water_heal: snap_g %d -> 0", (int)cur));
+	return healed;
 }
 
 } // namespace xiewa
