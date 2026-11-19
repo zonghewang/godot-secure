@@ -63,6 +63,7 @@ const char *kTagOmbrel = "ombrel";
 // gate()：返回 true 表示本次调用应被拦断（调用方直接返回空值）
 bool gate() {
 	if (g_block_a != 0 || g_block_b != 0) {
+		print_line(vformat("[xiewa] GATE BLOCKED a=%d b=%d", g_block_a, g_block_b));
 		return true;
 	}
 	uint64_t w = g_flag_w;
@@ -70,6 +71,7 @@ bool gate() {
 	uint32_t n = (w & 0xE) ? (uint32_t)d + 2 : (uint32_t)d;
 	if (n != 0) {
 		g_block_a |= (int)n; // lock or [0x5484D98], n
+		print_line(vformat("[xiewa] GATE BLOCKED w=%d n=%d", (int)w, (int)n));
 		return true;
 	}
 	return false;
@@ -279,13 +281,12 @@ PackedByteArray XiewaGuard::device_unwrap2(const PackedByteArray &in) {
 		// 用 kEntropyOrigGen2 作静态熵 + 无熵 DPAPI 写过 XWD3 的 user 段。
 		// 官方从不产生这种格式，所以它只出现在读路径；写路径（device_wrap2）
 		// 永远只用 ks，不会污染互通性。
+		print_line(vformat("[xiewa] unwrap2 FAIL in=%d ks=%s", in.size(), util::to_hex(ks, 8)));
 		return out;
 	}
 	out.resize((int)plain.size());
 	memcpy(out.ptrw(), plain.ptr(), (size_t)plain.size());
-#endif
-#ifdef DEBUG_ENABLED
-	print_line(vformat("[xiewa] device_unwrap2 in=%d -> %d", in.size(), out.size()));
+	print_line(vformat("[xiewa] unwrap2 OK in=%d ks=%s -> %d", in.size(), util::to_hex(ks, 8), out.size()));
 #endif
 	return out;
 }
@@ -335,6 +336,7 @@ PackedByteArray XiewaGuard::device_unwrap_m2(const PackedByteArray &in) {
 	if (in.size() >= 17 && in[0] == 2) {
 		PackedByteArray cipher = in.slice(17);
 		if (take(device_unwrap2(cipher))) {
+			print_line(vformat("[xiewa] unwrap_m2 A in=%d -> %d", in.size(), best.size()));
 			return best;
 		}
 #ifdef WINDOWS_ENABLED
@@ -350,6 +352,7 @@ PackedByteArray XiewaGuard::device_unwrap_m2(const PackedByteArray &in) {
 					memcpy(cand.ptrw(), p.ptr(), (size_t)p.size());
 				}
 				if (take(cand)) {
+					print_line(vformat("[xiewa] unwrap_m2 B in=%d -> %d", in.size(), best.size()));
 					return best;
 				}
 			}
@@ -358,11 +361,10 @@ PackedByteArray XiewaGuard::device_unwrap_m2(const PackedByteArray &in) {
 	}
 
 	if (take(device_unwrap2(in))) {
+		print_line(vformat("[xiewa] unwrap_m2 C in=%d -> %d", in.size(), best.size()));
 		return best;
 	}
-#ifdef DEBUG_ENABLED
-	print_line(vformat("[xiewa] device_unwrap_m2 in=%d -> %d", in.size(), best.size()));
-#endif
+	print_line(vformat("[xiewa] unwrap_m2 in=%d -> %d", in.size(), best.size()));
 	return best;
 }
 
