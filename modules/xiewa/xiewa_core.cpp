@@ -47,9 +47,7 @@
 #include "xiewa_guard.h"
 #include "xiewa_util.h"
 
-#include "core/config/engine.h"
 #include "core/object/ref_counted.h"
-#include "core/os/main_loop.h"
 #include "core/string/ustring.h"
 #include "core/variant/dictionary.h"
 #include "core/variant/variant.h"
@@ -383,11 +381,7 @@ Dictionary snap_live_counts(const Dictionary &p_data) {
 // 当前正在写入的 _save_data（LocalSaveManager 在 _write_save_file_v4 里持有）
 Dictionary snap_current_save_data() {
 	Dictionary empty;
-	Engine *eng = Engine::get_singleton();
-	if (eng == nullptr) {
-		return empty;
-	}
-	SceneTree *tree = Object::cast_to<SceneTree>(eng->get_main_loop());
+	SceneTree *tree = SceneTree::get_singleton();
 	if (tree == nullptr) {
 		return empty;
 	}
