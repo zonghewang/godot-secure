@@ -49,7 +49,9 @@ uint64_t g_first_tick = 0;
 //   K2(d,t) = SHA256( ((d‖0^32) ⊕ saltB) ‖ SHA256( ((d‖0^32) ⊕ saltA) ‖ t ) )
 //   saltA = "6666666666666666"(0x51F64B0)  saltB = "\\\\\\\\\\\\\\\\(0x51F64C0)
 // 用它对 Diao 的 profile.cfg（原版 ombrel DPAPI 两块）解封成功，得到 32 B 存档密钥。
-const uint8_t kEntropyOrigGen2[32] = {
+// [2026-11-19 对齐官方] 该常量已不再参与任何读写路径（官方 0x38F1B40 只认 ks），
+// 仅保留作历史取值记录，防止被误当成官方熵再次接回去。
+[[maybe_unused]] const uint8_t kEntropyOrigGen2[32] = {
 	0x2C, 0x74, 0x0F, 0x13, 0x13, 0x81, 0xCB, 0xFB,
 	0xAF, 0xBE, 0x83, 0x06, 0xC6, 0xCA, 0x29, 0x35,
 	0x3D, 0x20, 0x9D, 0x97, 0x26, 0x9D, 0xEF, 0xF4,
@@ -154,7 +156,7 @@ void xw2_entropy32(uint8_t r_out[32]) {
 	return true;
 }
 
-bool dpapi_unprotect(const Vector<uint8_t> &p_in, Vector<uint8_t> &r_out) {
+[[maybe_unused]] bool dpapi_unprotect(const Vector<uint8_t> &p_in, Vector<uint8_t> &r_out) {
 	DATA_BLOB in_blob;
 	in_blob.pbData = (BYTE *)p_in.ptr();
 	in_blob.cbData = (DWORD)p_in.size();
@@ -172,9 +174,12 @@ bool dpapi_unprotect(const Vector<uint8_t> &p_in, Vector<uint8_t> &r_out) {
 
 // 官方 0x38F1730 的 protect 分支（r9b != 0）：
 //   CryptProtectData(pDataIn, szDataDescr = L"ombrel",
-//                    pOptionalEntropy = 32 B, NULL, NULL, CRYPTPROTECT_UI_FORBIDDEN)
-// 0x38F1730 里 flags 的取法是 `movzx eax,[rsp+0xc0]; lea eax,[rax*4+1]`，
-//   wrap2 / unwrap2 / m2 三处调用都传 0 → flags 恒为 1；描述串与 device_wrap 同为 "ombrel"。
+//                    pOptionalEntropy = 32 B, NULL, NULL, flags)
+// 0x38F1730 里 flags 的取法是 `movzx eax,[rsp+0xc0]; lea eax,[rax*4+1]`：
+//   [rsp+0xc0] 是「第一个堆栈参数」（第 6 参）。
+//   wrap2 / unwrap2 传 0 → flags = 1（当前用户级）
+//   wrap_m2 / unwrap_m2 传 1 → flags = 5（当前用户级|机器级，见 dpapi_*_machine_entropy）
+// 描述串与 device_wrap 同为 "ombrel"。
 bool dpapi_protect_entropy2(const Vector<uint8_t> &p_in, const uint8_t *p_entropy,
 		Vector<uint8_t> &r_out) {
 	if (p_in.size() == 0) {
@@ -215,6 +220,58 @@ bool dpapi_unprotect_entropy(const Vector<uint8_t> &p_in, const uint8_t *p_entro
 	}
 	r_out.resize((int)out_blob.cbData);
 	memcpy(r_out.ptrw(), out_blob.pbData, out_blob.cbData);
+	LocalFree(out_blob.pbData);
+	return true;
+}
+
+// machine 级变体（0x38F1730 的 flags 真值修正 2026-11-19）：
+//   0x38F1730 里 `movzx eax, byte ptr [rsp+0xc0]; lea eax, [rax*4+1]`，
+//   [rsp+0xc0] 是「第一个堆栈参数」（第 6 参）。
+//   device_wrap2 / device_unwrap2 传 0  → flags = 1 = UI_FORBIDDEN（当前用户）
+//   device_wrap_m2 / device_unwrap_m2 传 1 → flags = 5 = UI_FORBIDDEN|LOCAL_MACHINE
+// 上一版注释写成“三处都传 0”是错的，导致 machine 段按当前用户级保护，官方按机器级读。
+bool dpapi_protect_machine_entropy(const Vector<uint8_t> &p_in, const uint8_t *p_entropy,
+		Vector<uint8_t> &r_out) {
+	if (p_in.size() == 0) {
+		return false;
+	}
+	DATA_BLOB in_blob;
+	in_blob.pbData = (BYTE *)p_in.ptr();
+	in_blob.cbData = (DWORD)p_in.size();
+	DATA_BLOB ent_blob;
+	ent_blob.pbData = (BYTE *)p_entropy;
+	ent_blob.cbData = 32;
+	DATA_BLOB out_blob;
+	memset(&out_blob, 0, sizeof(out_blob));
+	if (!CryptProtectData(&in_blob, L"ombrel", &ent_blob, nullptr, nullptr,
+				CRYPTPROTECT_UI_FORBIDDEN | CRYPTPROTECT_LOCAL_MACHINE, &out_blob)) {
+		return false;
+	}
+	r_out.resize((int)out_blob.cbData);
+	memcpy(r_out.ptrw(), out_blob.pbData, (size_t)out_blob.cbData);
+	LocalFree(out_blob.pbData);
+	return true;
+}
+
+bool dpapi_unprotect_machine_entropy(const Vector<uint8_t> &p_in, const uint8_t *p_entropy,
+		Vector<uint8_t> &r_out) {
+	if (p_in.size() == 0) {
+		return false;
+	}
+	DATA_BLOB in_blob;
+	in_blob.pbData = (BYTE *)p_in.ptr();
+	in_blob.cbData = (DWORD)p_in.size();
+	DATA_BLOB ent_blob;
+	ent_blob.pbData = (BYTE *)p_entropy;
+	ent_blob.cbData = 32;
+	DATA_BLOB out_blob;
+	memset(&out_blob, 0, sizeof(out_blob));
+	if (!CryptUnprotectData(&in_blob, nullptr, &ent_blob, nullptr, nullptr,
+				CRYPTPROTECT_UI_FORBIDDEN | CRYPTPROTECT_LOCAL_MACHINE, &out_blob)) {
+		return false;
+	}
+	r_out.resize((int)out_blob.cbData);
+	memcpy(r_out.ptrw(), out_blob.pbData, (size_t)out_blob.cbData);
 	LocalFree(out_blob.pbData);
 	return true;
 }
@@ -263,9 +320,9 @@ PackedByteArray XiewaGuard::device_unwrap2(const PackedByteArray &in) {
 #ifdef WINDOWS_ENABLED
 	// 官方 0x38F1B40 与 wrap2 完全对称：同 gate、同四表 mat32、同 HMAC，
 	// 唯一差别是 `xor r9d,r9d` → mode = 0 → CryptUnprotectData。
-	// 读路径额外保留一条 kEntropyOrigGen2 兜底，只为把 2026-11-17 之前自编译版写下的
-	// 旧本地数据读出来；官方版本从不产那种格式，写路径也永不用它，因此不影响互通。
-	// 也**不做**任何 keystream 反异或：那只会让非官方格式的坏数据被当成好数据。
+	// [2026-11-19 对齐官方] 删掉上一版的 kEntropyOrigGen2 兜底：官方 0x38F1B40
+	// 只认 ks 一种熵，没有任何 legacy 兜底，留着它会让本模块与官方行为不一致。
+	// 也不再做任何 keystream 反异或。
 	if (in.size() == 0) {
 		return out;
 	}
@@ -275,12 +332,7 @@ PackedByteArray XiewaGuard::device_unwrap2(const PackedByteArray &in) {
 	uint8_t ks[32];
 	xw2_entropy32(ks);
 	Vector<uint8_t> plain;
-	if (!dpapi_unprotect_entropy(cipher, ks, plain) &&
-			!dpapi_unprotect_entropy(cipher, kEntropyOrigGen2, plain)) {
-		// 第二条只用于“把用户既有本地数据读出来”：2026-11-17 之前的自编译版
-		// 用 kEntropyOrigGen2 作静态熵 + 无熵 DPAPI 写过 XWD3 的 user 段。
-		// 官方从不产生这种格式，所以它只出现在读路径；写路径（device_wrap2）
-		// 永远只用 ks，不会污染互通性。
+	if (!dpapi_unprotect_entropy(cipher, ks, plain)) {
 		print_line(vformat("[xiewa] unwrap2 FAIL in=%d ks=%s", in.size(), util::to_hex(ks, 8)));
 		return out;
 	}
@@ -291,81 +343,68 @@ PackedByteArray XiewaGuard::device_unwrap2(const PackedByteArray &in) {
 	return out;
 }
 
-// 带元信息：字节容器 = [0]=版本(2) / [1..16]=设备标签前 16 字节 / [17..]=DPAPI 密文
+// 机器级封装（0x38F1C70 / 0x38F1D70 / 0x38F2000 真值，2026-11-19 对齐）
+//   官方：① 0x38F1D70 枚举 CryptoAPI provider，拼 "xiewa-machine2|" + provider 名，
+//            再派生 32 B 机器密钥；② 0x38F1730(mode=1, 第 6 参 = 1)
+//            → CryptProtectData(desc="ombrel", entropy=该密钥, flags=5)。
+//   **没有任何版本字节、没有 16 字节标签、没有外壳**：输出就是一段纯 DPAPI blob，
+//   官方 device_unwrap_m2 也是把整个输入直接丢给 CryptUnprotectData。
+//   上一版加的 [02]+16B tag 是本模块自造的，官方根本不解析，会当成坏 blob。
+//   限制：0x38F1D70 的密钥来自运行时枚举的 provider 名，离线不可复刻；
+//   本模块以 ks 作熵，因此「格式完全对齐、密钥来源不同」。
+//   这只影响 machine 段本身（user 段正常时永不启用），不破坏 user 段的互通。
 PackedByteArray XiewaGuard::device_wrap_m2(const PackedByteArray &in) {
 	PackedByteArray out;
 	if (gate()) {
 		return out;
 	}
-	PackedByteArray cipher = device_wrap2(in);
-	if (cipher.size() == 0) {
+#ifdef WINDOWS_ENABLED
+	if (in.size() == 0) {
 		return out;
 	}
-	out.resize(1 + 16 + cipher.size());
-	uint8_t *w = out.ptrw();
-	w[0] = 2;
-	String tag = device_tag(String()).substr(0, 16);
-	for (int i = 0; i < 16; i++) {
-		w[1 + i] = i < tag.length() ? (uint8_t)tag[i] : 0;
+	Vector<uint8_t> plain;
+	plain.resize(in.size());
+	memcpy(plain.ptrw(), in.ptr(), (size_t)in.size());
+	uint8_t ks[32];
+	xw2_entropy32(ks);
+	Vector<uint8_t> cipher;
+	if (!dpapi_protect_machine_entropy(plain, ks, cipher)) {
+		print_line(vformat("[xiewa] wrap_m2 FAIL in=%d", in.size()));
+		return out;
 	}
-	for (int i = 0; i < cipher.size(); i++) {
-		w[17 + i] = cipher[i];
-	}
+	out.resize((int)cipher.size());
+	memcpy(out.ptrw(), cipher.ptr(), (size_t)cipher.size());
+	print_line(vformat("[xiewa] wrap_m2 OK in=%d -> %d", in.size(), out.size()));
+#endif
 	return out;
 }
 
 PackedByteArray XiewaGuard::device_unwrap_m2(const PackedByteArray &in) {
-	// machine 段在本项目里只承载密钥（32 B）。读路径按三条候选依次尝试：
-	//   A. [02][16B tag][DPAPI+ks]（官方/本模块写出的标准 machine 段）
-	//   B. A 的无熵 DPAPI 变体（2026-11-17 之前自编译版写的 machine 段）
-	//   C. 无前缀整段（早期写路径未加标记）
-	// 命中 32 B 立即成功；长度 != 32 的非空结果只作最后兜底，绝不优先返回——
-	// 否则脚本层 _ensure_save_key 会拿到非 32 的 key 并直接判 T4_KEY。
-	PackedByteArray best;
-	auto take = [&best](const PackedByteArray &cand) -> bool {
-		if (cand.size() == 32) {
-			best = cand;
-			return true;
-		}
-		if (!cand.is_empty() && best.is_empty()) {
-			best = cand;
-		}
-		return false;
-	};
-
-	if (in.size() >= 17 && in[0] == 2) {
-		PackedByteArray cipher = in.slice(17);
-		if (take(device_unwrap2(cipher))) {
-			print_line(vformat("[xiewa] unwrap_m2 A in=%d -> %d", in.size(), best.size()));
-			return best;
-		}
+	PackedByteArray out;
+	if (gate()) {
+		return out;
+	}
 #ifdef WINDOWS_ENABLED
-		if (cipher.size() > 0) {
-			Vector<uint8_t> c;
-			c.resize(cipher.size());
-			memcpy(c.ptrw(), cipher.ptr(), (size_t)cipher.size());
-			Vector<uint8_t> p;
-			if (dpapi_unprotect(c, p)) {
-				PackedByteArray cand;
-				cand.resize((int)p.size());
-				if (p.size() > 0) {
-					memcpy(cand.ptrw(), p.ptr(), (size_t)p.size());
-				}
-				if (take(cand)) {
-					print_line(vformat("[xiewa] unwrap_m2 B in=%d -> %d", in.size(), best.size()));
-					return best;
-				}
-			}
-		}
+	// 官方 0x38F2000：没有前缀识别、没有 tag 校验，整个输入就是一个 DPAPI blob，
+	// 用 0x38F1D70 派生的机器密钥 + flags=5 解。
+	if (in.size() == 0) {
+		return out;
+	}
+	Vector<uint8_t> cipher;
+	cipher.resize(in.size());
+	memcpy(cipher.ptrw(), in.ptr(), (size_t)in.size());
+	uint8_t ks[32];
+	xw2_entropy32(ks);
+	Vector<uint8_t> plain;
+	if (!dpapi_unprotect_machine_entropy(cipher, ks, plain)) {
+		print_line(vformat("[xiewa] unwrap_m2 FAIL in=%d", in.size()));
+		return out;
+	}
+	out.resize((int)plain.size());
+	memcpy(out.ptrw(), plain.ptr(), (size_t)plain.size());
+	print_line(vformat("[xiewa] unwrap_m2 OK in=%d -> %d", in.size(), out.size()));
 #endif
-	}
-
-	if (take(device_unwrap2(in))) {
-		print_line(vformat("[xiewa] unwrap_m2 C in=%d -> %d", in.size(), best.size()));
-		return best;
-	}
-	print_line(vformat("[xiewa] unwrap_m2 in=%d -> %d", in.size(), best.size()));
-	return best;
+	return out;
 }
 
 // =============================================================================
