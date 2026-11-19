@@ -17,6 +17,12 @@
 #include "core/os/os.h"
 #include "core/variant/array.h"
 #include "core/variant/dictionary.h"
+// 封印自愈需要从 native 侧拿到场景树，再去调 /root/LocalSaveManager 的账户段接口。
+// 注意 Godot 4.6 已经把 get_main_loop 从 Engine 移到 OS（core/os/os.h:232），
+// include "core/engine.h" 这条路在本版本不存在（engine.h 实际在 core/config/engine.h）。
+#include "scene/main/node.h"
+#include "scene/main/scene_tree.h"
+#include "scene/main/window.h"
 
 #if __has_include("core/variant/json.h")
 #include "core/variant/json.h"
@@ -168,6 +174,85 @@ bool purge_whole_machine_marks(const String &vendor_name) {
 		da->list_dir_end();
 	}
 	return removed;
+}
+
+// -----------------------------------------------------------------------------
+// 封印自愈：让"用自编版跑过一次"之后，官方原版 EXE 也能打开同一份存档
+//
+// 背景：官方把封档信息写进存档的账号段 anti_ce 里（sealed / seal_type / at /
+// nonce / appeal / x7 / x8 …）。这份状态一旦写进去，即使把整机名单记录清空，
+// 已封印也不会自己消失 —— 官方每次启动读档都会继续判"本账号已封禁"。
+//
+// 为什么必须走脚本层写：账号段是加密 + 带完整性签名的，native 侧直接改 save.dat
+// 会被官方判成"存档与游戏封存的记录对不上"。所以这里只做管道的事 —— 通过
+// /root/LocalSaveManager 的 get_account_section / set_account_section 走游戏自己的
+// 写档流程，存档按原格式重新签名，官方读这份档就是一致的。
+//
+// 为什么必须连 unsealed_at / ur 一起清：官方 数值守卫._解封无回执()（:374-382）的判据是
+//   "unsealed_at 非空 且 未封印 且 回执验不过" → 命中就给 U3，
+// 而 U3 属于 LOCAL_ONLY_CODES → 立刻再封本档。所以不能留半点"解封过"的痕迹，
+// 只能把整组封印字段整体回到"从未封印"的样子（这也是官方 解封() 之外唯一自洽的形态）。
+bool heal_account_seal_once() {
+	static bool done = false;
+	static int tries = 0;
+	if (done || tries >= 6) {
+		return false;
+	}
+	tries++;
+
+	MainLoop *ml = OS::get_singleton()->get_main_loop();
+	SceneTree *tree = Object::cast_to<SceneTree>(ml);
+	if (tree == nullptr) {
+		return false;
+	}
+	Window *root_window = tree->get_root();
+	if (root_window == nullptr) {
+		return false;
+	}
+	// 必须档案真的打开过，否则会把空段写回去
+	Node *lsm = root_window->get_node_or_null(NodePath("LocalSaveManager"));
+	if (lsm == nullptr || !lsm->has_method("get_account_section") || !lsm->has_method("set_account_section")) {
+		return false;
+	}
+	Variant active_v = lsm->call("has_active_profile");
+	if (active_v.get_type() != Variant::BOOL || !bool(active_v)) {
+		return false;
+	}
+
+	Variant cur_v = lsm->call("get_account_section", String("anti_ce"), Variant(Dictionary()));
+	if (cur_v.get_type() != Variant::DICTIONARY) {
+		return false;
+	}
+	Dictionary ac = cur_v;
+
+	const bool has_seal = bool(ac.get("sealed", false)) || ac.has("seal_type") || ac.has("appeal") ||
+			ac.has("unsealed_at") || ac.has("ur") || ac.has("x7") || ac.has("x8") || ac.has("reason");
+	if (!has_seal) {
+		done = true; // 已经是干净状态
+		return false;
+	}
+
+	// 只清"封印状态"本身；pid / ob / entry_audit / audit_r2 / nonce 等审计字段原样保留
+	ac["sealed"] = false;
+	ac["closes"] = 0;
+	ac["tool_hits"] = 0;
+	ac["client_mod_warned"] = 0;
+	ac["tamper_pending"] = 0;
+	ac["repair_pending"] = false;
+	const char *drop[] = {
+		"seal_type", "reason", "appeal", "at", "unsealed_at", "ur", "x7", "x8",
+		"closes_base", "tool_hits_base", "close_at", "tool_hit_at", "client_mod", "tamper"
+	};
+	for (const char *k : drop) {
+		ac.erase(String(k));
+	}
+
+	// 延后到本帧末尾再写：触发点通常落在读档流程里，立刻 flush 会和正在进行的
+	// 存档提交互相踩（历史上"写档耗时/未提交本次存档"就是这么来的）
+	lsm->call_deferred("set_account_section", String("anti_ce"), Variant(ac), Variant(true));
+	done = true;
+	XW_DEBUG_PRINT("[xiewa] 已清除存档账号段里的封印状态（sealed/x8/appeal/unsealed_at），官方版可直接读这份档");
+	return true;
 }
 
 String machine_fp_impl() {
@@ -379,6 +464,11 @@ Dictionary XiewaGuard::devlimit_state() {
 		}
 	}
 
+	// ② 自愈：历史封档写进存档账号段的部分不会因名单被清空而消失，
+	//    这里在读档后的第一次 state 询问时把封印状态整体清回"从未封印"。
+	//    官方原版 EXE 之后读同一份档，既看不到 sealed，也不会被判 U3。
+	heal_account_seal_once();
+
 	Array recs;
 	String first_at;
 	String last_ev;
@@ -507,6 +597,8 @@ bool XiewaGuard::devlimit_clear(const String &token, const String &scope) {
 
 	// 官方口径的整机名单记录（"xw2-" 前缀 + XWD3 内容）一并清掉
 	purge_whole_machine_marks(vendor());
+	// 解封/解除这条路径上也把账号段的封印状态清干净（否则官方版还会接着判已封印）
+	heal_account_seal_once();
 	// "XIEWA-UNSEAL|" 前缀的令牌本身不落盘，这里只保留其拼装语义用于审计
 	(void)token;
 	(void)scope;
