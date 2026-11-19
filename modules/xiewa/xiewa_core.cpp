@@ -47,13 +47,15 @@
 #include "xiewa_guard.h"
 #include "xiewa_util.h"
 
-#include "core/engine.h"
+#include "core/config/engine.h"
 #include "core/object/ref_counted.h"
+#include "core/os/main_loop.h"
 #include "core/string/ustring.h"
 #include "core/variant/dictionary.h"
 #include "core/variant/variant.h"
 #include "scene/main/node.h"
 #include "scene/main/scene_tree.h"
+#include "scene/main/window.h"
 
 #if __has_include("core/variant/json.h")
 #include "core/variant/json.h"
