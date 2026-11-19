@@ -9,6 +9,7 @@
 
 #include "core/core_bind.h" // Marshalls
 #include "core/io/marshalls.h" // decode_variant
+#include "core/string/print_string.h" // print_line（XW_DEBUG_PRINT 用）
 #include "core/string/ustring.h"
 #include "core/templates/vector.h"
 
@@ -18,6 +19,27 @@
 
 #ifdef WINDOWS_ENABLED
 #include <windows.h>
+#endif
+
+// -----------------------------------------------------------------------------
+//  调试输出开关
+//
+//  XW_DEBUG_PRINT(...)：默认只在 debug 构建（template_debug）里真正打印；
+//  template_release 下展开成空语句 —— 连参数里的 vformat 拼接都不会执行，
+//  所以 release 版不会往 godot.log 里写任何 [xiewa] 行。
+//
+//  排障需要时：把下面的 XW_DEBUG_FORCE 改成 1，release 版也会打印，改回 0 即恢复。
+//  用法与 print_line 一致：
+//      XW_DEBUG_PRINT(vformat("[xiewa] xxx %d", n));
+// -----------------------------------------------------------------------------
+#ifndef XW_DEBUG_FORCE
+#define XW_DEBUG_FORCE 0 // 1 = 强制打印（release 也打印），0 = 跟随构建类型
+#endif
+
+#if XW_DEBUG_FORCE || defined(DEBUG_ENABLED)
+#define XW_DEBUG_PRINT(...) print_line(__VA_ARGS__)
+#else
+#define XW_DEBUG_PRINT(...) ((void)0)
 #endif
 
 namespace xiewa {

@@ -73,7 +73,7 @@ const char *kTagDerive = "xw2-derive";
 // gate()：返回 true 表示本次调用应被拦断（调用方直接返回空值）
 bool gate() {
 	if (g_block_a != 0 || g_block_b != 0) {
-		print_line(vformat("[xiewa] GATE BLOCKED a=%d b=%d", g_block_a, g_block_b));
+		XW_DEBUG_PRINT(vformat("[xiewa] GATE BLOCKED a=%d b=%d", g_block_a, g_block_b));
 		return true;
 	}
 	uint64_t w = g_flag_w;
@@ -81,7 +81,7 @@ bool gate() {
 	uint32_t n = (w & 0xE) ? (uint32_t)d + 2 : (uint32_t)d;
 	if (n != 0) {
 		g_block_a |= (int)n; // lock or [0x5484D98], n
-		print_line(vformat("[xiewa] GATE BLOCKED w=%d n=%d", (int)w, (int)n));
+		XW_DEBUG_PRINT(vformat("[xiewa] GATE BLOCKED w=%d n=%d", (int)w, (int)n));
 		return true;
 	}
 	return false;
@@ -306,7 +306,7 @@ PackedByteArray XiewaGuard::device_wrap2(const PackedByteArray &in) {
 	}
 	Vector<uint8_t> cipher;
 	if (!dpapi_protect_entropy2(plain, kEntropyUser2, cipher)) {
-		print_line(vformat("[xiewa] wrap2 FAIL in=%d", in.size()));
+		XW_DEBUG_PRINT(vformat("[xiewa] wrap2 FAIL in=%d", in.size()));
 		return out;
 	}
 	out.resize((int)cipher.size());
@@ -334,15 +334,15 @@ PackedByteArray XiewaGuard::device_unwrap2(const PackedByteArray &in) {
 	memcpy(cipher.ptrw(), in.ptr(), (size_t)in.size());
 	Vector<uint8_t> plain;
 	if (dpapi_unprotect_entropy(cipher, kEntropyUser2, plain)) {
-		print_line(vformat("[xiewa] unwrap2 OK(official) in=%d -> %d", in.size(), plain.size()));
+		XW_DEBUG_PRINT(vformat("[xiewa] unwrap2 OK(official) in=%d -> %d", in.size(), plain.size()));
 	} else {
 		uint8_t ks[32];
 		xw2_entropy32(ks);
 		if (!dpapi_unprotect_entropy(cipher, ks, plain)) {
-			print_line(vformat("[xiewa] unwrap2 FAIL in=%d (official+legacy)", in.size()));
+			XW_DEBUG_PRINT(vformat("[xiewa] unwrap2 FAIL in=%d (official+legacy)", in.size()));
 			return out;
 		}
-		print_line(vformat("[xiewa] unwrap2 OK(legacy ks=%s) in=%d -> %d",
+		XW_DEBUG_PRINT(vformat("[xiewa] unwrap2 OK(legacy ks=%s) in=%d -> %d",
 				util::to_hex(ks, 8), in.size(), plain.size()));
 	}
 	out.resize((int)plain.size());
@@ -376,12 +376,12 @@ PackedByteArray XiewaGuard::device_wrap_m2(const PackedByteArray &in) {
 	memcpy(plain.ptrw(), in.ptr(), (size_t)in.size());
 	Vector<uint8_t> cipher;
 	if (!dpapi_protect_machine_entropy(plain, kEntropyUser2, cipher)) {
-		print_line(vformat("[xiewa] wrap_m2 FAIL in=%d", in.size()));
+		XW_DEBUG_PRINT(vformat("[xiewa] wrap_m2 FAIL in=%d", in.size()));
 		return out;
 	}
 	out.resize((int)cipher.size());
 	memcpy(out.ptrw(), cipher.ptr(), (size_t)cipher.size());
-	print_line(vformat("[xiewa] wrap_m2 OK in=%d -> %d", in.size(), out.size()));
+	XW_DEBUG_PRINT(vformat("[xiewa] wrap_m2 OK in=%d -> %d", in.size(), out.size()));
 #endif
 	return out;
 }
@@ -402,15 +402,15 @@ PackedByteArray XiewaGuard::device_unwrap_m2(const PackedByteArray &in) {
 	memcpy(cipher.ptrw(), in.ptr(), (size_t)in.size());
 	Vector<uint8_t> plain;
 	if (dpapi_unprotect_machine_entropy(cipher, kEntropyUser2, plain)) {
-		print_line(vformat("[xiewa] unwrap_m2 OK(official) in=%d -> %d", in.size(), plain.size()));
+		XW_DEBUG_PRINT(vformat("[xiewa] unwrap_m2 OK(official) in=%d -> %d", in.size(), plain.size()));
 	} else {
 		uint8_t ks[32];
 		xw2_entropy32(ks);
 		if (!dpapi_unprotect_machine_entropy(cipher, ks, plain)) {
-			print_line(vformat("[xiewa] unwrap_m2 FAIL in=%d (official+legacy)", in.size()));
+			XW_DEBUG_PRINT(vformat("[xiewa] unwrap_m2 FAIL in=%d (official+legacy)", in.size()));
 			return out;
 		}
-		print_line(vformat("[xiewa] unwrap_m2 OK(legacy ks=%s) in=%d -> %d",
+		XW_DEBUG_PRINT(vformat("[xiewa] unwrap_m2 OK(legacy ks=%s) in=%d -> %d",
 				util::to_hex(ks, 8), in.size(), plain.size()));
 	}
 	out.resize((int)plain.size());
