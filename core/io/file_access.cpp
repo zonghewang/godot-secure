@@ -948,56 +948,7 @@ Vector<uint8_t> FileAccess::get_file_as_bytes(const String &p_path, Error *r_err
 	return data;
 }
 
-// -----------------------------------------------------------------------------
-// [xiewa] 外部白名单覆写
-// 官方把 EXE 白名单塞在 res://resources/安全/official_exe.json，而它位于带签名的
-// XiewaPai.pck 内：直接改 pck 会让目录哈希变化 → XiewaPai.pck.sig 验签失败 →
-// 守护.gd verify_pack_signature() 直接"发布包校验失败，拒绝启动"。
-// 所以这里改成"读的时候覆写"：exe 同目录若存在 xiewa_whitelist_override.json，
-// 读取该路径时就用它顶替原内容。pck 与签名保持原样，其它资源完全不受影响。
-// 白名单文件由 XiewaWhitelist.py 生成。
-// -----------------------------------------------------------------------------
-static String _xiewa_whitelist_override(const String &p_path) {
-	OS *os = OS::get_singleton();
-	if (os == nullptr) {
-		return String();
-	}
-	String base = os->get_executable_path().get_base_dir();
-	String want_res = "res://resources/安全/official_exe.json";
-	String want_scripts = base.path_join("XiewaPai.pck.scripts").replace("\\", "/");
-	String norm = p_path.replace("\\", "/");
-
-	String name;
-	if (norm == want_res) {
-		name = "xiewa_whitelist_override.json";
-	} else if (norm == want_scripts) {
-		// XiewaPai.pck.scripts 的 body 里也有一份 exe_sha256（作者签名的），
-		// 不顶替它，加了白名单的 exe 会被 check_set() 判"文件不成套"直接中断启动。
-		name = "xiewa_scripts_override.json";
-	} else {
-		return String();
-	}
-
-	String ov = base.path_join(name);
-	if (!FileAccess::exists(ov)) {
-		return String();
-	}
-	Ref<FileAccess> f = FileAccess::open(ov, FileAccess::READ);
-	if (f.is_null()) {
-		return String();
-	}
-	return f->get_as_text();
-}
-
 String FileAccess::get_file_as_string(const String &p_path, Error *r_error) {
-	// 白名单覆写优先于 pck 里的原文件
-	String ov = _xiewa_whitelist_override(p_path);
-	if (!ov.is_empty()) {
-		if (r_error) {
-			*r_error = OK;
-		}
-		return ov;
-	}
 	Error err;
 	Vector<uint8_t> array = get_file_as_bytes(p_path, &err);
 	if (r_error) {
